@@ -1,0 +1,20 @@
+# docker build -t cli-metronome .
+# docker compose up
+
+version: '3.9'
+services:
+  metronome:
+    image: cli-metronome
+    stdin_open: true
+    tty: true
+    devices:
+      - /dev/snd:/dev/snd
+    volumes:
+      - ${XDG_RUNTIME_DIR}/pipewire-0:/tmp/runtime/pipewire-0
+      - ${XDG_RUNTIME_DIR}/pulse:/tmp/runtime/pulse:ro
+    environment:
+      - XDG_RUNTIME_DIR=/tmp/runtime
+      - PIPEWIRE_RUNTIME_DIR=/tmp/runtime
+      - PULSE_SERVER=unix:/tmp/runtime/pulse/native
+    group_add:
+      - audio
