@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rodio::{OutputStream, Sink};
 use crossterm::{
     cursor,
@@ -93,6 +93,8 @@ struct AtomicState {
     remaining_ticks: AtomicU32,
     sound_type: AtomicU32,
     ui_dirty: AtomicBool,
+    last_tick_time: AtomicU64, // Store as nanoseconds since epoch
+    tick_count: AtomicU32,
 }
 
 impl AtomicState {
@@ -105,6 +107,8 @@ impl AtomicState {
             remaining_ticks: AtomicU32::new(0),
             sound_type: AtomicU32::new(1),
             ui_dirty: AtomicBool::new(true),
+            last_tick_time: AtomicU64::new(0),
+            tick_count: AtomicU32::new(0),
         }
     }
 
@@ -118,6 +122,29 @@ impl AtomicState {
             self.sound_type.store(index as u32, Ordering::Relaxed);
         }
     }
+
+    fn update_tick(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        self.last_tick_time.store(now, Ordering::Relaxed);
+        self.tick_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get_last_tick_elapsed(&self) -> Duration {
+        let last_tick_nanos = self.last_tick_time.load(Ordering::Relaxed);
+        if last_tick_nanos == 0 {
+            return Duration::from_secs(999); // Return a large duration if no tick yet
+        }
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        
+        Duration::from_nanos(now.saturating_sub(last_tick_nanos))
+    }
 }
 
 #[derive(Default)]
@@ -128,12 +155,14 @@ struct UICache {
     last_random_mode: bool,
     last_remaining_ticks: u32,
     last_random_count: u32,
+    last_tick_count: u32,
     first_render: bool,
     bpm_buffer: String,
     sound_buffer: String,
     status_buffer: String,
     ticks_buffer: String,
     count_buffer: String,
+    animation_buffer: String,
 }
 
 impl UICache {
@@ -145,6 +174,7 @@ impl UICache {
             status_buffer: String::with_capacity(16),
             ticks_buffer: String::with_capacity(32),
             count_buffer: String::with_capacity(8),
+            animation_buffer: String::with_capacity(80),
             ..Default::default()
         }
     }
@@ -174,15 +204,83 @@ impl SoundCache {
 }
 
 const HEADER_ROW: u16 = 0;
-const BPM_ROW: u16 = 2;
-const SOUND_ROW: u16 = 3;
-const STATUS_ROW: u16 = 4;
-const RANDOM_MODE_ROW: u16 = 5;
-const REMAINING_TICKS_ROW: u16 = 6;
-const RANDOM_COUNT_ROW: u16 = 7;
-const CONTROLS_START_ROW: u16 = 9;
-const SOUNDS_LIST_ROW: u16 = 21;
-const TIP_ROW: u16 = 23;
+const ANIMATION_ROW: u16 = 1;
+const BPM_ROW: u16 = 3;
+const SOUND_ROW: u16 = 4;
+const STATUS_ROW: u16 = 5;
+const RANDOM_MODE_ROW: u16 = 6;
+const REMAINING_TICKS_ROW: u16 = 7;
+const RANDOM_COUNT_ROW: u16 = 8;
+const CONTROLS_START_ROW: u16 = 10;
+const SOUNDS_LIST_ROW: u16 = 22;
+const TIP_ROW: u16 = 24;
+
+fn generate_tick_animation(state: &Arc<AtomicState>) -> String {
+    const ANIMATION_WIDTH: usize = 60;
+    const TICK_SYMBOL: char = '♪';
+    const BAR_SYMBOL: char = '─';
+    
+    let bpm = state.bpm.load(Ordering::Relaxed);
+    let is_running = state.is_running.load(Ordering::Relaxed);
+    let tick_count = state.tick_count.load(Ordering::Relaxed);
+    
+    if !is_running {
+        return format!("{:─<width$}", "", width = ANIMATION_WIDTH);
+    }
+    
+    let elapsed = state.get_last_tick_elapsed();
+    let beat_duration = Duration::from_millis(60000 / bpm as u64);
+    
+    // Calculate progress through current beat (0.0 to 1.0)
+    let progress = if beat_duration.as_millis() > 0 {
+        (elapsed.as_millis() as f64 / beat_duration.as_millis() as f64).min(1.0)
+    } else {
+        0.0
+    };
+    
+    // Calculate position of the tick indicator
+    let tick_pos = (progress * (ANIMATION_WIDTH - 1) as f64) as usize;
+    
+    // Create the animation bar
+    let mut animation = vec![BAR_SYMBOL; ANIMATION_WIDTH];
+    
+    // Add tick markers at regular intervals (every 4 beats)
+    let beats_per_measure = 4;
+    let marker_spacing = ANIMATION_WIDTH / beats_per_measure;
+    for i in 0..beats_per_measure {
+        let pos = i * marker_spacing;
+        if pos < ANIMATION_WIDTH {
+            animation[pos] = if (tick_count as usize / beats_per_measure) % 2 == 0 { '|' } else { '┃' };
+        }
+    }
+    
+    // Add the moving tick indicator
+    if tick_pos < ANIMATION_WIDTH {
+        animation[tick_pos] = TICK_SYMBOL;
+    }
+    
+    // Add visual emphasis for recent ticks (fade effect)
+    let fade_duration = Duration::from_millis(200);
+    if elapsed < fade_duration {
+        let fade_progress = elapsed.as_millis() as f64 / fade_duration.as_millis() as f64;
+        let emphasis_size = ((1.0 - fade_progress) * 3.0) as usize;
+        
+        for i in 0..=emphasis_size {
+            if tick_pos >= i && tick_pos + i < ANIMATION_WIDTH {
+                if i == 0 {
+                    animation[tick_pos] = '♫';
+                } else {
+                    animation[tick_pos - i] = '◦';
+                    if tick_pos + i < ANIMATION_WIDTH {
+                        animation[tick_pos + i] = '◦';
+                    }
+                }
+            }
+        }
+    }
+    
+    animation.into_iter().collect()
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AtomicState::new());
@@ -211,7 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffered_stdout = BufWriter::new(stdout);
     
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(33);
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16); // 60 FPS for smooth animation
     
     let mut input_check_time = Instant::now();
     const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(8);
@@ -219,8 +317,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
         
-        let should_update_ui = state.ui_dirty.load(Ordering::Relaxed) && 
-                              now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL;
+        // Update UI more frequently for smooth animation
+        let should_update_ui = now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL ||
+                              state.ui_dirty.load(Ordering::Relaxed);
         
         if should_update_ui {
             display_ui_optimized(&state, &ui_cache, &mut buffered_stdout)?;
@@ -304,6 +403,7 @@ fn display_ui_optimized(
     let current_random_mode = state.random_mode.load(Ordering::Relaxed);
     let current_remaining_ticks = state.remaining_ticks.load(Ordering::Relaxed);
     let current_random_count = state.random_count.load(Ordering::Relaxed);
+    let current_tick_count = state.tick_count.load(Ordering::Relaxed);
     
     if cache.first_render {
         execute!(
@@ -366,6 +466,34 @@ fn display_ui_optimized(
         cache.first_render = false;
     }
     
+    // Update tick animation (always update for smooth animation)
+    let animation = generate_tick_animation(state);
+    if animation != cache.animation_buffer || current_status != cache.last_status {
+        cache.animation_buffer = animation.clone();
+        
+        execute!(
+            writer,
+            cursor::MoveTo(0, ANIMATION_ROW),
+            Clear(ClearType::UntilNewLine),
+        )?;
+        
+        if current_status {
+            execute!(
+                writer,
+                SetForegroundColor(Color::Green),
+                Print(&format!("🎼 {}", animation)),
+                ResetColor,
+            )?;
+        } else {
+            execute!(
+                writer,
+                SetForegroundColor(Color::DarkGrey),
+                Print(&format!("⏸  {}", animation)),
+                ResetColor,
+            )?;
+        }
+    }
+    
     if current_bpm != cache.last_bpm {
         cache.bpm_buffer.clear();
         cache.bpm_buffer.push_str(&current_bpm.to_string());
@@ -399,11 +527,11 @@ fn display_ui_optimized(
     if current_status != cache.last_status {
         cache.status_buffer.clear();
         let (status_text, status_color) = if current_status {
-            ("RUNNING ♪", Color::Green)
+            (format!("RUNNING ♪ (Beat #{})", current_tick_count), Color::Green)
         } else {
-            ("STOPPED", Color::Red)
+            (String::from("STOPPED"), Color::Red)
         };
-        cache.status_buffer.push_str(status_text);
+        cache.status_buffer.push_str(&status_text);
         
         execute!(
             writer,
@@ -414,6 +542,20 @@ fn display_ui_optimized(
             ResetColor,
         )?;
         cache.last_status = current_status;
+    } else if current_status && current_tick_count != cache.last_tick_count {
+        // Update beat counter when running
+        cache.status_buffer.clear();
+        cache.status_buffer.push_str(&format!("RUNNING ♪ (Beat #{})", current_tick_count));
+        
+        execute!(
+            writer,
+            cursor::MoveTo(8, STATUS_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(Color::Green),
+            Print(&cache.status_buffer),
+            ResetColor,
+        )?;
+        cache.last_tick_count = current_tick_count;
     }
     
     if current_random_mode != cache.last_random_mode {
@@ -490,7 +632,7 @@ fn display_ui_optimized(
     }
     
     cache.ticks_buffer.clear();
-    cache.ticks_buffer.push_str(&format!("💡 Random mode changes BPM every {} ticks", current_random_count));
+    cache.ticks_buffer.push_str(&format!("💡 Random mode changes BPM every {} ticks • Animation shows beat progress", current_random_count));
     
     execute!(
         writer,
@@ -518,7 +660,7 @@ fn metronome_loop(
     loop {
         let should_tick = {
             if !state.is_running.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(5)); // Shorter sleep when stopped
+                thread::sleep(Duration::from_millis(5));
                 continue;
             }
             
@@ -532,6 +674,9 @@ fn metronome_loop(
         };
         
         if should_tick {
+            // Update tick timing for animation
+            state.update_tick();
+            
             let sound_type = state.get_sound_type();
             let sound_data = sound_cache.get_sound(sound_type).clone();
             
@@ -571,6 +716,12 @@ fn toggle_metronome(state: &Arc<AtomicState>) {
        state.remaining_ticks.load(Ordering::Relaxed) == 0 {
         state.remaining_ticks.store(state.random_count.load(Ordering::Relaxed), Ordering::Relaxed);
     }
+    
+    // Reset tick counter when starting
+    if !was_running {
+        state.tick_count.store(0, Ordering::Relaxed);
+    }
+    
     state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
