@@ -93,7 +93,7 @@ struct AtomicState {
     remaining_ticks: AtomicU32,
     sound_type: AtomicU32,
     ui_dirty: AtomicBool,
-    last_tick_time: AtomicU64, // Store as nanoseconds since epoch
+    last_tick_time: AtomicU64,
     tick_count: AtomicU32,
 }
 
@@ -135,7 +135,7 @@ impl AtomicState {
     fn get_last_tick_elapsed(&self) -> Duration {
         let last_tick_nanos = self.last_tick_time.load(Ordering::Relaxed);
         if last_tick_nanos == 0 {
-            return Duration::from_secs(999); // Return a large duration if no tick yet
+            return Duration::from_secs(999);
         }
         
         let now = std::time::SystemTime::now()
@@ -231,20 +231,16 @@ fn generate_tick_animation(state: &Arc<AtomicState>) -> String {
     let elapsed = state.get_last_tick_elapsed();
     let beat_duration = Duration::from_millis(60000 / bpm as u64);
     
-    // Calculate progress through current beat (0.0 to 1.0)
     let progress = if beat_duration.as_millis() > 0 {
         (elapsed.as_millis() as f64 / beat_duration.as_millis() as f64).min(1.0)
     } else {
         0.0
     };
     
-    // Calculate position of the tick indicator
     let tick_pos = (progress * (ANIMATION_WIDTH - 1) as f64) as usize;
     
-    // Create the animation bar
     let mut animation = vec![BAR_SYMBOL; ANIMATION_WIDTH];
     
-    // Add tick markers at regular intervals (every 4 beats)
     let beats_per_measure = 4;
     let marker_spacing = ANIMATION_WIDTH / beats_per_measure;
     for i in 0..beats_per_measure {
@@ -254,12 +250,10 @@ fn generate_tick_animation(state: &Arc<AtomicState>) -> String {
         }
     }
     
-    // Add the moving tick indicator
     if tick_pos < ANIMATION_WIDTH {
         animation[tick_pos] = TICK_SYMBOL;
     }
     
-    // Add visual emphasis for recent ticks (fade effect)
     let fade_duration = Duration::from_millis(200);
     if elapsed < fade_duration {
         let fade_progress = elapsed.as_millis() as f64 / fade_duration.as_millis() as f64;
@@ -309,7 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffered_stdout = BufWriter::new(stdout);
     
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16); // 60 FPS for smooth animation
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
     
     let mut input_check_time = Instant::now();
     const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(8);
@@ -317,7 +311,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
         
-        // Update UI more frequently for smooth animation
         let should_update_ui = now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL ||
                               state.ui_dirty.load(Ordering::Relaxed);
         
@@ -466,7 +459,6 @@ fn display_ui_optimized(
         cache.first_render = false;
     }
     
-    // Update tick animation (always update for smooth animation)
     let animation = generate_tick_animation(state);
     if animation != cache.animation_buffer || current_status != cache.last_status {
         cache.animation_buffer = animation.clone();
@@ -543,7 +535,6 @@ fn display_ui_optimized(
         )?;
         cache.last_status = current_status;
     } else if current_status && current_tick_count != cache.last_tick_count {
-        // Update beat counter when running
         cache.status_buffer.clear();
         cache.status_buffer.push_str(&format!("RUNNING ♪ (Beat #{})", current_tick_count));
         
@@ -674,7 +665,6 @@ fn metronome_loop(
         };
         
         if should_tick {
-            // Update tick timing for animation
             state.update_tick();
             
             let sound_type = state.get_sound_type();
@@ -717,7 +707,6 @@ fn toggle_metronome(state: &Arc<AtomicState>) {
         state.remaining_ticks.store(state.random_count.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     
-    // Reset tick counter when starting
     if !was_running {
         state.tick_count.store(0, Ordering::Relaxed);
     }
