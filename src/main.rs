@@ -13,6 +13,9 @@ use crossterm::{
 };
 use rand::Rng;
 
+use crate::utlitites::sound::{create_beep_sound, create_kick_sound, create_click_sound, create_cowbell_sound, create_hihat_sound, create_square_sound, create_triangle_sound,};
+mod utlitites;
+
 #[derive(Clone)]
 struct MetronomeState {
     bpm: u32,
@@ -39,34 +42,16 @@ enum AudioCommand {
     Stop,
 }
 
-fn create_beep_sound() -> Vec<f32> {
-    let sample_rate = 44100;
-    let frequency = 800.0;
-    let duration_ms = 50;
-    let samples = (sample_rate * duration_ms / 1000) as usize;
-    
-    let mut wave: Vec<f32> = Vec::with_capacity(samples);
-    for i in 0..samples {
-        let t = i as f32 / sample_rate as f32;
-        let sample = (t * frequency * 2.0 * std::f32::consts::PI).sin() * 0.3;
-        wave.push(sample);
-    }
-    wave
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(MetronomeState::new()));
     
-    // Channels for communication between threads
-    let (tick_tx, tick_rx) = mpsc::channel(); // For tick notifications
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioCommand>(); // For audio commands
+    let (tick_tx, tick_rx) = mpsc::channel();
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioCommand>();
     
-    // Initialize audio in main thread
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
-    let beep_sound = create_beep_sound();
+    let beep_sound = create_kick_sound();
     
-    // Start the metronome thread
     let state_clone = Arc::clone(&state);
     let tick_tx_clone = tick_tx.clone();
     let audio_tx_clone = audio_tx.clone();
@@ -75,14 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metronome_loop(state_clone, tick_tx_clone, audio_tx_clone);
     });
     
-    // Enable raw mode for better terminal control
     enable_raw_mode()?;
     
-    // Main UI loop
     loop {
         display_ui(&state)?;
         
-        // Handle audio commands
         if let Ok(cmd) = audio_rx.try_recv() {
             match cmd {
                 AudioCommand::PlayTick => {
@@ -93,16 +75,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Check for tick notifications
         if let Ok(_) = tick_rx.try_recv() {
             // Tick received, UI will be updated in next iteration
         }
         
-        // Handle user input
         if poll(Duration::from_millis(50))? {
             match read()? {
                 Event::Key(key_event) => {
-                    // Only handle key press events, not key release
                     if key_event.kind == crossterm::event::KeyEventKind::Press {
                         match key_event.code {
                             KeyCode::Char('q') => {
@@ -223,17 +202,19 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
             ResetColor,
         )?;
         
-        // Always show remaining ticks when random mode is active
-        let remaining = if state_guard.remaining_ticks == 0 && state_guard.is_running {
-            state_guard.random_count // Show what it will be initialized to
+        if state_guard.is_running {
+            execute!(
+                io::stdout(),
+                Print(format!("Remaining ticks: {}\n", state_guard.remaining_ticks)),
+            )?;
         } else {
-            state_guard.remaining_ticks
-        };
-        
-        execute!(
-            io::stdout(),
-            Print(format!("Remaining ticks: {}\n", remaining)),
-        )?;
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print("(Start metronome to begin countdown)\n"),
+                ResetColor,
+            )?;
+        }
         
         println!("Random count setting: {}", state_guard.random_count);
     } else {
@@ -274,9 +255,11 @@ fn toggle_random_mode(state: &Arc<Mutex<MetronomeState>>) {
     let mut state_guard = state.lock().unwrap();
     state_guard.random_mode = !state_guard.random_mode;
     
-    // Initialize remaining ticks when turning on random mode
+    // Initialize remaining ticks when turning on random mode, but only if metronome is running
     if state_guard.random_mode {
-        state_guard.remaining_ticks = state_guard.random_count;
+        if state_guard.is_running {
+            state_guard.remaining_ticks = state_guard.random_count;
+        }
     } else {
         // Reset remaining ticks when turning off random mode
         state_guard.remaining_ticks = 0;
@@ -311,3 +294,187 @@ rodio = "0.17"
 crossterm = "0.27"
 rand = "0.8"
 */
+
+
+// use std::f32::consts::PI;
+
+// // Option 1: Classic metronome click (short, sharp sound)
+// fn create_click_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration_ms = 10; // Very short for sharp click
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         // High frequency with quick decay
+//         let envelope = (-t * 50.0).exp(); // Exponential decay
+//         let sample = (t * 2000.0 * 2.0 * PI).sin() * envelope * 0.5;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 2: Wood block sound (two frequencies)
+// fn create_wood_block_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration_ms = 80;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let envelope = (-t * 15.0).exp();
+        
+//         // Mix two frequencies for wood-like sound
+//         let freq1 = 1200.0;
+//         let freq2 = 800.0;
+//         let sample1 = (t * freq1 * 2.0 * PI).sin() * 0.3;
+//         let sample2 = (t * freq2 * 2.0 * PI).sin() * 0.2;
+//         let sample = (sample1 + sample2) * envelope;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 3: Cowbell sound
+// fn create_cowbell_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration_ms = 120;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let envelope = (-t * 8.0).exp();
+        
+//         // Multiple harmonics for metallic sound
+//         let fundamental = 800.0;
+//         let sample = (
+//             (t * fundamental * 2.0 * PI).sin() * 0.4 +
+//             (t * fundamental * 2.4 * 2.0 * PI).sin() * 0.3 +
+//             (t * fundamental * 3.2 * 2.0 * PI).sin() * 0.2 +
+//             (t * fundamental * 4.1 * 2.0 * PI).sin() * 0.1
+//         ) * envelope;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 4: Kick drum sound
+// fn create_kick_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration_ms = 150;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let envelope = (-t * 12.0).exp();
+        
+//         // Low frequency with pitch sweep
+//         let freq = 60.0 * (-t * 10.0).exp(); // Frequency drops quickly
+//         let sample = (t * freq * 2.0 * PI).sin() * envelope * 0.6;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 5: Hi-hat sound (noise-based)
+// fn create_hihat_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration_ms = 60;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     let mut rng = rand::thread_rng();
+    
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let envelope = (-t * 25.0).exp();
+        
+//         // White noise filtered through high frequencies
+//         let noise: f32 = rng.gen_range(-1.0..1.0);
+//         let filtered_noise = noise * envelope * 0.3;
+        
+//         // Add some high frequency content
+//         let high_freq = (t * 8000.0 * 2.0 * PI).sin() * envelope * 0.1;
+        
+//         let sample = filtered_noise + high_freq;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 6: Sine wave with different frequency (original but customizable)
+// fn create_custom_beep_sound(frequency: f32, duration_ms: u32, volume: f32) -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let sample = (t * frequency * 2.0 * PI).sin() * volume;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 7: Triangle wave (softer than sine)
+// fn create_triangle_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let frequency = 800.0;
+//     let duration_ms = 80;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let phase = (t * frequency) % 1.0;
+        
+//         // Triangle wave
+//         let sample = if phase < 0.5 {
+//             4.0 * phase - 1.0
+//         } else {
+//             3.0 - 4.0 * phase
+//         } * 0.3;
+        
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// // Option 8: Square wave (more digital/electronic sound)
+// fn create_square_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let frequency = 600.0;
+//     let duration_ms = 60;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let phase = (t * frequency) % 1.0;
+        
+//         // Square wave with envelope
+//         let envelope = (-t * 10.0).exp();
+//         let sample = if phase < 0.5 { 1.0 } else { -1.0 } * 0.3 * envelope;
+//         wave.push(sample);
+//     }
+//     wave
+// }
+
+// fn create_beep_soundcreate_beep_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let frequency = 800.0;
+//     let duration_ms = 50;
+//     let samples = (sample_rate * duration_ms / 1000) as usize;
+    
+//     let mut wave: Vec<f32> = Vec::with_capacity(samples);
+//     for i in 0..samples {
+//         let t = i as f32 / sample_rate as f32;
+//         let sample = (t * frequency * 2.0 * std::f32::consts::PI).sin() * 0.3;
+//         wave.push(sample);
+//     }
+//     wave
+// }
