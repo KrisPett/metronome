@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
-use rodio::{OutputStream, Sink, Source};
+use rodio::{OutputStream, Sink};
 use crossterm::{
     cursor,
     event::{poll, read, Event, KeyCode, KeyEventKind},
@@ -289,7 +289,7 @@ fn adjust_bpm(state: &Arc<Mutex<MetronomeState>>, change: i32) {
     state_guard.bpm = new_bpm;
 }
 
-fn adjust_random_count(state: &Arc<Mutex<MetronomeState>>) {
+fn adjust_random_count(state: &Arc<Mutex<MetronomeState>>, change: i32) {
     let mut state_guard = state.lock().unwrap();
     let new_count = (state_guard.random_count as i32 + change).max(10).min(1000) as u32;
     state_guard.random_count = new_count;
