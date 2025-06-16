@@ -298,7 +298,6 @@ fn display_ui_optimized(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cache = ui_cache.lock().unwrap();
     
-    // Load all atomic values once
     let current_bpm = state.bpm.load(Ordering::Relaxed);
     let current_sound = state.get_sound_type();
     let current_status = state.is_running.load(Ordering::Relaxed);

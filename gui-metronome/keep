@@ -1,0 +1,845 @@
+use std::io::{self, Write, BufWriter, Stdout};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use rodio::{OutputStream, Sink};
+use crossterm::{
+    cursor,
+    event::{poll, read, Event, KeyCode, KeyEventKind},
+    execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+};
+use rand::Rng;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use crate::utilities::sound::{create_beep_sound, create_kick_sound, create_click_sound, create_cowbell_sound, create_hihat_sound, create_square_sound, create_triangle_sound, create_wood_block_sound};
+mod utilities;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SoundType {
+    Beep,
+    Kick,
+    Click,
+    Cowbell,
+    Hihat,
+    Square,
+    Triangle,
+    Woodblock
+}
+
+impl Default for SoundType {
+    fn default() -> Self {
+        SoundType::Kick
+    }
+}
+
+impl SoundType {
+    const ALL: [SoundType; 8] = [
+        SoundType::Beep,
+        SoundType::Kick,
+        SoundType::Click,
+        SoundType::Cowbell,
+        SoundType::Hihat,
+        SoundType::Square,
+        SoundType::Triangle,
+        SoundType::Woodblock,
+    ];
+
+    fn next(&self) -> Self {
+        let current_idx = Self::ALL.iter().position(|&s| s == *self).unwrap();
+        Self::ALL[(current_idx + 1) % Self::ALL.len()]
+    }
+
+    fn prev(&self) -> Self {
+        let current_idx = Self::ALL.iter().position(|&s| s == *self).unwrap();
+        Self::ALL[(current_idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            SoundType::Beep => "Beep",
+            SoundType::Kick => "Kick",
+            SoundType::Click => "Click",
+            SoundType::Cowbell => "Cowbell",
+            SoundType::Hihat => "Hi-hat",
+            SoundType::Square => "Square",
+            SoundType::Triangle => "Triangle",
+            SoundType::Woodblock => "Woodblock",
+        }
+    }
+
+    fn create_sound(&self) -> Vec<f32> {
+        match self {
+            SoundType::Beep => create_beep_sound(),
+            SoundType::Kick => create_kick_sound(),
+            SoundType::Click => create_click_sound(),
+            SoundType::Cowbell => create_cowbell_sound(),
+            SoundType::Hihat => create_hihat_sound(),
+            SoundType::Square => create_square_sound(),
+            SoundType::Triangle => create_triangle_sound(),
+            SoundType::Woodblock => create_wood_block_sound(),
+        }
+    }
+}
+
+// Ultra-fast lock-free state with atomic operations
+struct AtomicState {
+    bpm: AtomicU32,
+    is_running: AtomicBool,
+    random_mode: AtomicBool,
+    random_count: AtomicU32,
+    remaining_ticks: AtomicU32,
+    sound_type: AtomicU32,
+    ui_dirty: AtomicBool,
+    // High-precision timing
+    next_tick_time: AtomicU64, // nanoseconds since epoch
+    tick_interval: AtomicU64,  // nanoseconds
+    // Performance counters
+    total_ticks: AtomicU64,
+    ui_updates: AtomicU64,
+}
+
+impl AtomicState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            bpm: AtomicU32::new(120),
+            is_running: AtomicBool::new(false),
+            random_mode: AtomicBool::new(false),
+            random_count: AtomicU32::new(100),
+            remaining_ticks: AtomicU32::new(0),
+            sound_type: AtomicU32::new(1), // Kick
+            ui_dirty: AtomicBool::new(true),
+            next_tick_time: AtomicU64::new(0),
+            tick_interval: AtomicU64::new(500_000_000), // 500ms in nanos
+            total_ticks: AtomicU64::new(0),
+            ui_updates: AtomicU64::new(0),
+        }
+    }
+
+    fn get_sound_type(&self) -> SoundType {
+        let index = self.sound_type.load(Ordering::Acquire) as usize;
+        SoundType::ALL[index.min(SoundType::ALL.len() - 1)]
+    }
+
+    fn set_sound_type(&self, sound_type: SoundType) {
+        if let Some(index) = SoundType::ALL.iter().position(|&s| s == sound_type) {
+            self.sound_type.store(index as u32, Ordering::Release);
+        }
+    }
+
+    fn update_timing(&self, bpm: u32) {
+        let interval_nanos = (60_000_000_000u64 / bpm as u64);
+        self.tick_interval.store(interval_nanos, Ordering::Release);
+    }
+
+    fn set_next_tick(&self, time_nanos: u64) {
+        self.next_tick_time.store(time_nanos, Ordering::Release);
+    }
+
+    fn should_tick(&self, current_time_nanos: u64) -> bool {
+        current_time_nanos >= self.next_tick_time.load(Ordering::Acquire)
+    }
+}
+
+// Lock-free circular buffer for audio commands
+struct LockFreeAudioQueue {
+    buffer: Vec<Option<AudioCommand>>,
+    write_pos: AtomicU32,
+    read_pos: AtomicU32,
+    capacity: u32,
+}
+
+impl LockFreeAudioQueue {
+    fn new(capacity: usize) -> Self {
+        let mut buffer = Vec::with_capacity(capacity);
+        buffer.resize_with(capacity, || None);
+        Self {
+            buffer,
+            write_pos: AtomicU32::new(0),
+            read_pos: AtomicU32::new(0),
+            capacity: capacity as u32,
+        }
+    }
+
+    fn try_push(&self, item: AudioCommand) -> bool {
+        let current_write = self.write_pos.load(Ordering::Acquire);
+        let next_write = (current_write + 1) % self.capacity;
+        let current_read = self.read_pos.load(Ordering::Acquire);
+
+        if next_write == current_read {
+            return false; // Queue full
+        }
+
+        unsafe {
+            let ptr = self.buffer.as_ptr().add(current_write as usize) as *mut Option<AudioCommand>;
+            ptr.write(Some(item));
+        }
+
+        self.write_pos.store(next_write, Ordering::Release);
+        true
+    }
+
+    fn try_pop(&self) -> Option<AudioCommand> {
+        let current_read = self.read_pos.load(Ordering::Acquire);
+        let current_write = self.write_pos.load(Ordering::Acquire);
+
+        if current_read == current_write {
+            return None; // Queue empty
+        }
+
+        let item = unsafe {
+            let ptr = self.buffer.as_ptr().add(current_read as usize) as *mut Option<AudioCommand>;
+            ptr.read().take()
+        };
+
+        self.read_pos.store((current_read + 1) % self.capacity, Ordering::Release);
+        item
+    }
+}
+
+// Thread-local cached UI state for zero-allocation updates
+#[derive(Default)]
+struct UICache {
+    last_bpm: u32,
+    last_sound: SoundType,
+    last_status: bool,
+    last_random_mode: bool,
+    last_remaining_ticks: u32,
+    last_random_count: u32,
+    first_render: bool,
+    // Pre-allocated buffers with extra capacity
+    bmp_buffer: String,
+    sound_buffer: String,
+    status_buffer: String,
+    ticks_buffer: String,
+    count_buffer: String,
+    format_buffer: String, // Reusable formatting buffer
+}
+
+impl UICache {
+    fn new() -> Self {
+        Self {
+            first_render: true,
+            bmp_buffer: String::with_capacity(16),
+            sound_buffer: String::with_capacity(32),
+            status_buffer: String::with_capacity(32),
+            ticks_buffer: String::with_capacity(64),
+            count_buffer: String::with_capacity(16),
+            format_buffer: String::with_capacity(128),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Clone)]
+enum AudioCommand {
+    PlayTick(SoundType), // Just store type, not data
+    Stop,
+}
+
+// Read-optimized sound cache with precomputed data
+struct SoundCache {
+    sounds: HashMap<SoundType, Vec<f32>>,
+    // Cache rodio sources for ultra-fast playback
+    source_cache: RwLock<HashMap<SoundType, Vec<u8>>>,
+}
+
+impl SoundCache {
+    fn new() -> Self {
+        let mut sounds = HashMap::new();
+        // Parallel sound generation
+        let handles: Vec<_> = SoundType::ALL.iter().map(|&sound_type| {
+            thread::spawn(move || {
+                (sound_type, sound_type.create_sound())
+            })
+        }).collect();
+
+        for handle in handles {
+            let (sound_type, sound_data) = handle.join().unwrap();
+            sounds.insert(sound_type, sound_data);
+        }
+
+        Self {
+            sounds,
+            source_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_sound(&self, sound_type: SoundType) -> &Vec<f32> {
+        &self.sounds[&sound_type]
+    }
+}
+
+// UI command queue for decoupled updates
+enum UICommand {
+    UpdateAll,
+    UpdateField(UIField),
+    Shutdown,
+}
+
+#[derive(Clone, Copy)]
+enum UIField {
+    BPM,
+    Sound,
+    Status,
+    RandomMode,
+    RemainingTicks,
+    RandomCount,
+}
+
+// Layout constants
+const HEADER_ROW: u16 = 0;
+const BPM_ROW: u16 = 2;
+const SOUND_ROW: u16 = 3;
+const STATUS_ROW: u16 = 4;
+const RANDOM_MODE_ROW: u16 = 5;
+const REMAINING_TICKS_ROW: u16 = 6;
+const RANDOM_COUNT_ROW: u16 = 7;
+const PERF_ROW: u16 = 8; // Performance stats
+const CONTROLS_START_ROW: u16 = 10;
+const SOUNDS_LIST_ROW: u16 = 22;
+const TIP_ROW: u16 = 24;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AtomicState::new());
+    let sound_cache = Arc::new(SoundCache::new());
+    
+    // Lock-free audio queue for maximum performance
+    let audio_queue = Arc::new(LockFreeAudioQueue::new(1024));
+    
+    // UI command queue
+    let (ui_tx, ui_rx) = mpsc::channel::<UICommand>();
+    
+    let (_stream, stream_handle) = OutputStream::try_default()?;
+    let sink = Sink::try_new(&stream_handle)?;
+    
+    // === THREAD 1: High-Priority Metronome Timer ===
+    let state_timer = Arc::clone(&state);
+    let audio_queue_timer = Arc::clone(&audio_queue);
+    let ui_tx_timer = ui_tx.clone();
+    
+    thread::spawn(move || {
+        // Set high thread priority if possible
+        let mut last_random_update = Instant::now();
+        let mut rng = rand::thread_rng();
+        
+        loop {
+            if !state_timer.is_running.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+
+            let now = Instant::now();
+            let now_nanos = now.elapsed().as_nanos() as u64;
+            
+            if state_timer.should_tick(now_nanos) {
+                // Send audio command
+                let sound_type = state_timer.get_sound_type();
+                if !audio_queue_timer.try_push(AudioCommand::PlayTick(sound_type)) {
+                    // Queue full, skip this tick (should rarely happen)
+                }
+
+                // Update timing for next tick
+                let interval = state_timer.tick_interval.load(Ordering::Acquire);
+                state_timer.set_next_tick(now_nanos + interval);
+                
+                // Increment tick counter
+                state_timer.total_ticks.fetch_add(1, Ordering::Relaxed);
+
+                // Handle random mode
+                if state_timer.random_mode.load(Ordering::Acquire) {
+                    let mut remaining = state_timer.remaining_ticks.load(Ordering::Acquire);
+                    if remaining == 0 {
+                        remaining = state_timer.random_count.load(Ordering::Acquire);
+                    }
+                    
+                    remaining -= 1;
+                    state_timer.remaining_ticks.store(remaining, Ordering::Release);
+                    
+                    if remaining == 0 {
+                        let new_bpm = rng.gen_range(60..=200);
+                        state_timer.bpm.store(new_bpm, Ordering::Release);
+                        state_timer.update_timing(new_bpm);
+                        state_timer.remaining_ticks.store(
+                            state_timer.random_count.load(Ordering::Acquire), 
+                            Ordering::Release
+                        );
+                    }
+                }
+
+                // Signal UI update
+                state_timer.ui_dirty.store(true, Ordering::Release);
+                let _ = ui_tx_timer.try_send(UICommand::UpdateAll);
+            } else {
+                // Precise sleep until next tick
+                let next_tick = state_timer.next_tick_time.load(Ordering::Acquire);
+                if next_tick > now_nanos {
+                    let sleep_nanos = next_tick - now_nanos;
+                    if sleep_nanos > 1_000_000 { // > 1ms
+                        thread::sleep(Duration::from_nanos(sleep_nanos / 2));
+                    } else {
+                        while Instant::now().elapsed().as_nanos() as u64 < next_tick {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // === THREAD 2: Audio Processing ===
+    let audio_queue_audio = Arc::clone(&audio_queue);
+    let sound_cache_audio = Arc::clone(&sound_cache);
+    
+    thread::spawn(move || {
+        loop {
+            if let Some(cmd) = audio_queue_audio.try_pop() {
+                match cmd {
+                    AudioCommand::PlayTick(sound_type) => {
+                        let sound_data = sound_cache_audio.get_sound(sound_type).clone();
+                        let source = rodio::buffer::SamplesBuffer::new(1, 44100, sound_data);
+                        sink.append(source);
+                    }
+                    AudioCommand::Stop => break,
+                }
+            } else {
+                thread::sleep(Duration::from_micros(100));
+            }
+        }
+    });
+
+    let state_ui = Arc::clone(&state);
+    let ui_cache = Arc::new(Mutex::new(UICache::new()));
+    
+    thread::spawn(move || {
+        let stdout = io::stdout();
+        let mut writer = BufWriter::with_capacity(8192, stdout);
+        let mut last_update = Instant::now();
+        let update_interval = Duration::from_millis(16);
+        
+        loop {
+            match ui_rx.try_recv() {
+                Ok(UICommand::UpdateAll) => {
+                    if last_update.elapsed() >= update_interval {
+                        if let Err(_) = display_ui_ultra_fast(&state_ui, &ui_cache, &mut writer) {
+                            break;
+                        }
+                        last_update = Instant::now();
+                        state_ui.ui_updates.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(UICommand::Shutdown) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    });
+
+    enable_raw_mode()?;
+    execute!(io::stdout(), cursor::Hide)?;
+
+    let mut input_time = Instant::now();
+    let input_interval = Duration::from_micros(2000);
+
+    loop {
+        if input_time.elapsed() >= input_interval {
+            if poll(Duration::from_millis(0))? {
+                match read()? {
+                    Event::Key(key_event) => {
+                        if key_event.kind == KeyEventKind::Press {
+                            match key_event.code {
+                                KeyCode::Char('q') => {
+                                    if !audio_queue.try_push(AudioCommand::Stop) {
+                                        // Force stop
+                                    }
+                                    let _ = ui_tx.send(UICommand::Shutdown);
+                                    break;
+                                }
+                                KeyCode::Char(' ') => {
+                                    toggle_metronome(&state);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::Status));
+                                }
+                                KeyCode::Char('r') => {
+                                    toggle_random_mode(&state);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::RandomMode));
+                                }
+                                KeyCode::Up => {
+                                    adjust_bpm(&state, 5);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::BPM));
+                                }
+                                KeyCode::Down => {
+                                    adjust_bpm(&state, -5);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::BPM));
+                                }
+                                KeyCode::Right => {
+                                    adjust_bpm(&state, 1);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::BPM));
+                                }
+                                KeyCode::Left => {
+                                    adjust_bpm(&state, -1);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::BPM));
+                                }
+                                KeyCode::Char('+') => {
+                                    adjust_random_count(&state, 10);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::RandomCount));
+                                }
+                                KeyCode::Char('-') => {
+                                    adjust_random_count(&state, -10);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::RandomCount));
+                                }
+                                KeyCode::Char('s') => {
+                                    cycle_sound(&state, true);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::Sound));
+                                }
+                                KeyCode::Char('a') => {
+                                    cycle_sound(&state, false);
+                                    let _ = ui_tx.try_send(UICommand::UpdateField(UIField::Sound));
+                                }
+                                KeyCode::Char('t') => {
+                                    test_current_sound(&state, &audio_queue);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            input_time = Instant::now();
+        } else {
+            // Adaptive sleep - shorter when expecting input
+            thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    execute!(io::stdout(), cursor::Show)?;
+    disable_raw_mode()?;
+    println!("\nMetronome stopped. Goodbye!");
+    Ok(())
+}
+
+fn display_ui_ultra_fast(
+    state: &Arc<AtomicState>, 
+    ui_cache: &Arc<Mutex<UICache>>,
+    writer: &mut BufWriter<Stdout>
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache = ui_cache.lock().unwrap();
+    
+    // Batch load all atomics once for consistency
+    let current_bpm = state.bpm.load(Ordering::Acquire);
+    let current_sound = state.get_sound_type();
+    let current_status = state.is_running.load(Ordering::Acquire);
+    let current_random_mode = state.random_mode.load(Ordering::Acquire);
+    let current_remaining_ticks = state.remaining_ticks.load(Ordering::Acquire);
+    let current_random_count = state.random_count.load(Ordering::Acquire);
+    let total_ticks = state.total_ticks.load(Ordering::Relaxed);
+    let ui_updates = state.ui_updates.load(Ordering::Relaxed);
+    
+    if cache.first_render {
+        // Initial full render with performance optimizations
+        execute!(
+            writer,
+            Clear(ClearType::All),
+            cursor::MoveTo(0, HEADER_ROW),
+            SetForegroundColor(Color::Blue),
+            Print("🎵 ULTRA-PERFORMANCE CLI METRONOME 🎵"),
+            ResetColor,
+        )?;
+        
+        // Static labels - drawn once
+        let labels = [
+            (BPM_ROW, "BPM: "),
+            (SOUND_ROW, "Sound: "),
+            (STATUS_ROW, "Status: "),
+            (RANDOM_MODE_ROW, "Random mode: "),
+            (REMAINING_TICKS_ROW, "Remaining ticks: "),
+            (RANDOM_COUNT_ROW, "Random count: "),
+            (PERF_ROW, "Performance: "),
+        ];
+        
+        for (row, label) in labels.iter() {
+            execute!(writer, cursor::MoveTo(0, *row), Print(label))?;
+        }
+        
+        // Controls (static content)
+        execute!(
+            writer,
+            cursor::MoveTo(0, CONTROLS_START_ROW),
+            SetForegroundColor(Color::Yellow),
+            Print("📋 CONTROLS (500Hz input, 60fps UI, μs-precision timing):"),
+            ResetColor,
+        )?;
+        
+        let controls = [
+            "  SPACE     - Start/Stop metronome",
+            "  R         - Toggle random mode", 
+            "  ↑/↓       - Adjust BPM by 5",
+            "  ←/→       - Adjust BPM by 1",
+            "  +/-       - Adjust random count by 10",
+            "  S         - Next sound",
+            "  A         - Previous sound", 
+            "  T         - Test current sound",
+            "  Q         - Quit",
+        ];
+        
+        for (i, control) in controls.iter().enumerate() {
+            execute!(
+                writer,
+                cursor::MoveTo(0, CONTROLS_START_ROW + 1 + i as u16),
+                Print(control),
+            )?;
+        }
+        
+        execute!(
+            writer,
+            cursor::MoveTo(0, SOUNDS_LIST_ROW),
+            SetForegroundColor(Color::Cyan),
+            Print("🔊 Available sounds (parallel-generated):"),
+            ResetColor,
+        )?;
+        execute!(
+            writer,
+            cursor::MoveTo(0, SOUNDS_LIST_ROW + 1),
+            Print("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock"),
+        )?;
+        
+        cache.first_render = false;
+    }
+    
+    // Ultra-fast conditional updates using pre-allocated buffers
+    if current_bpm != cache.last_bpm {
+        cache.bmp_buffer.clear();
+        use std::fmt::Write;
+        write!(&mut cache.bmp_buffer, "{}", current_bpm).unwrap();
+        
+        execute!(
+            writer,
+            cursor::MoveTo(5, BPM_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(Color::Cyan),
+            Print(&cache.bmp_buffer),
+            ResetColor,
+        )?;
+        cache.last_bpm = current_bpm;
+    }
+    
+    if current_sound != cache.last_sound {
+        cache.sound_buffer.clear();
+        cache.sound_buffer.push_str(current_sound.name());
+        
+        execute!(
+            writer,
+            cursor::MoveTo(7, SOUND_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(Color::Magenta),
+            Print(&cache.sound_buffer),
+            ResetColor,
+        )?;
+        cache.last_sound = current_sound;
+    }
+    
+    if current_status != cache.last_status {
+        cache.status_buffer.clear();
+        let (status_text, status_color) = if current_status {
+            ("RUNNING ♪♫♪", Color::Green)
+        } else {
+            ("STOPPED", Color::Red)
+        };
+        cache.status_buffer.push_str(status_text);
+        
+        execute!(
+            writer,
+            cursor::MoveTo(8, STATUS_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(status_color),
+            Print(&cache.status_buffer),
+            ResetColor,
+        )?;
+        cache.last_status = current_status;
+    }
+    
+    if current_random_mode != cache.last_random_mode {
+        execute!(
+            writer,
+            cursor::MoveTo(13, RANDOM_MODE_ROW),
+            Clear(ClearType::UntilNewLine),
+        )?;
+        
+        if current_random_mode {
+            execute!(
+                writer,
+                SetForegroundColor(Color::Yellow),
+                Print("🎲 ACTIVE (lock-free)"),
+                ResetColor,
+            )?;
+        } else {
+            execute!(
+                writer,
+                SetForegroundColor(Color::DarkGrey),
+                Print("OFF"),
+                ResetColor,
+            )?;
+        }
+        cache.last_random_mode = current_random_mode;
+    }
+    
+    if current_remaining_ticks != cache.last_remaining_ticks {
+        cache.ticks_buffer.clear();
+        
+        execute!(
+            writer,
+            cursor::MoveTo(17, REMAINING_TICKS_ROW),
+            Clear(ClearType::UntilNewLine),
+        )?;
+        
+        if current_random_mode && current_status {
+            use std::fmt::Write;
+            write!(&mut cache.ticks_buffer, "{}", current_remaining_ticks).unwrap();
+            execute!(
+                writer,
+                SetForegroundColor(Color::White),
+                Print(&cache.ticks_buffer),
+                ResetColor,
+            )?;
+        } else if current_random_mode && !current_status {
+            execute!(
+                writer,
+                SetForegroundColor(Color::DarkGrey),
+                Print("(Start to begin countdown)"),
+                ResetColor,
+            )?;
+        } else {
+            execute!(
+                writer,
+                SetForegroundColor(Color::DarkGrey),
+                Print("-"),
+                ResetColor,
+            )?;
+        }
+        cache.last_remaining_ticks = current_remaining_ticks;
+    }
+    
+    if current_random_count != cache.last_random_count {
+        cache.count_buffer.clear();
+        use std::fmt::Write;
+        write!(&mut cache.count_buffer, "{}", current_random_count).unwrap();
+        
+        execute!(
+            writer,
+            cursor::MoveTo(15, RANDOM_COUNT_ROW),
+            Clear(ClearType::UntilNewLine),
+            Print(&cache.count_buffer),
+        )?;
+        cache.last_random_count = current_random_count;
+    }
+    
+    // Performance stats (updated every frame)
+    cache.format_buffer.clear();
+    use std::fmt::Write;
+    write!(&mut cache.format_buffer, "Ticks: {} | UI Updates: {} | FPS: ~60", 
+           total_ticks, ui_updates).unwrap();
+    
+    execute!(
+        writer,
+        cursor::MoveTo(13, PERF_ROW),
+        Clear(ClearType::UntilNewLine),
+        SetForegroundColor(Color::Green),
+        Print(&cache.format_buffer),
+        ResetColor,
+    )?;
+    
+    // Tip with performance info
+    cache.format_buffer.clear();
+    write!(&mut cache.format_buffer, 
+           "💡 Random mode changes BPM every {} ticks | Lock-free | Parallel | Ultra-fast", 
+           current_random_count).unwrap();
+    
+    execute!(
+        writer,
+        cursor::MoveTo(0, TIP_ROW),
+        Clear(ClearType::UntilNewLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print(&cache.format_buffer),
+        ResetColor,
+    )?;
+    
+    writer.flush()?;
+    Ok(())
+}
+
+// Atomic operations with memory ordering optimizations
+fn toggle_metronome(state: &Arc<AtomicState>) {
+    let was_running = state.is_running.load(Ordering::Acquire);
+    state.is_running.store(!was_running, Ordering::Release);
+    
+    if !was_running {
+        // Reset timing
+        let now = Instant::now().elapsed().as_nanos() as u64;
+        let interval = state.tick_interval.load(Ordering::Acquire);
+        state.set_next_tick(now + interval);
+        
+        if state.random_mode.load(Ordering::Acquire) && 
+           state.remaining_ticks.load(Ordering::Acquire) == 0 {
+            state.remaining_ticks.store(state.random_count.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+    state.ui_dirty.store(true, Ordering::Release);
+}
+
+fn toggle_random_mode(state: &Arc<AtomicState>) {
+    let was_random = state.random_mode.load(Ordering::Acquire);
+    state.random_mode.store(!was_random, Ordering::Release);
+    
+    if !was_random {
+        if state.is_running.load(Ordering::Acquire) {
+            state.remaining_ticks.store(state.random_count.load(Ordering::Acquire), Ordering::Release);
+        }
+    } else {
+        state.remaining_ticks.store(0, Ordering::Release);
+    }
+    state.ui_dirty.store(true, Ordering::Release);
+}
+
+fn adjust_bpm(state: &Arc<AtomicState>, change: i32) {
+    let current = state.bpm.load(Ordering::Acquire);
+    let new_bpm = (current as i32 + change).max(30).min(300) as u32;
+    state.bpm.store(new_bpm, Ordering::Release);
+    state.update_timing(new_bpm);
+    state.ui_dirty.store(true, Ordering::Release);
+}
+
+fn adjust_random_count(state: &Arc<AtomicState>, change: i32) {
+    let current = state.random_count.load(Ordering::Acquire);
+    let new_count = (current as i32 + change).max(10).min(1000) as u32;
+    state.random_count.store(new_count, Ordering::Release);
+    
+    if state.random_mode.load(Ordering::Acquire) && state.is_running.load(Ordering::Acquire) {
+        let remaining = state.remaining_ticks.load(Ordering::Acquire);
+        if new_count > remaining {
+            state.remaining_ticks.store(new_count, Ordering::Release);
+        }
+    }
+    state.ui_dirty.store(true, Ordering::Release);
+}
+
+fn cycle_sound(state: &Arc<AtomicState>, forward: bool) {
+    let current = state.get_sound_type();
+    let new_sound = if forward { current.next() } else { current.prev() };
+    state.set_sound_type(new_sound);
+    state.ui_dirty.store(true, Ordering::Release);
+}
+
+fn test_current_sound(
+    state: &Arc<AtomicState>, 
+    audio_queue: &Arc<LockFreeAudioQueue>
+) {
+    let sound_type = state.get_sound_type();
+    let _ = audio_queue.try_push(AudioCommand::PlayTick(sound_type));
+}
