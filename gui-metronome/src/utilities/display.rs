@@ -46,7 +46,6 @@ pub fn display_enhanced_ui(
     if cache.first_render {
         execute!(writer, Clear(ClearType::All))?;
 
-        // Animated title with gradient effect
         execute!(
             writer,
             cursor::MoveTo(25, TITLE_ROW),
@@ -68,7 +67,6 @@ pub fn display_enhanced_ui(
             ResetColor,
         )?;
 
-        // Main divider
         execute!(
             writer,
             cursor::MoveTo(10, DIVIDER_ROW),
@@ -283,7 +281,6 @@ pub fn display_enhanced_ui(
             ResetColor,
         )?;
 
-        // Volume bar
         let volume_progress = current_volume as f64 / 100.0;
         let volume_bar = create_progress_bar(volume_progress, 15, '#', '.');
         execute!(
@@ -388,7 +385,6 @@ fn generate_enhanced_tick_animation(state: &Arc<AtomicState>) -> String {
     let tick_count = state.tick_count.load(Ordering::Relaxed);
 
     if !is_running {
-        // Use ASCII characters to avoid UTF-8 boundary issues
         let idle_pattern = "=".repeat(ANIMATION_WIDTH);
         return format!("⏸️  {}", idle_pattern);
     }
