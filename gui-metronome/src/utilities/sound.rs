@@ -1,5 +1,5 @@
-use std::f32::consts::PI;
 use rand::Rng;
+use std::f32::consts::PI;
 
 pub fn create_click_sound() -> Vec<f32> {
     let sample_rate = 44100;
