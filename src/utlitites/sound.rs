@@ -57,7 +57,6 @@ pub fn create_cowbell_sound() -> Vec<f32> {
     wave
 }
 
-// Option 4: Kick drum sound
 pub fn create_kick_sound() -> Vec<f32> {
     let sample_rate = 44100;
     let duration_ms = 150;

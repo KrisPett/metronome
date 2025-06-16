@@ -13,7 +13,7 @@ use crossterm::{
 };
 use rand::Rng;
 
-use crate::utlitites::sound::{create_beep_sound, create_kick_sound, create_click_sound, create_cowbell_sound, create_hihat_sound, create_square_sound, create_triangle_sound,};
+use crate::utlitites::sound::{create_beep_sound, create_kick_sound, create_click_sound, create_cowbell_sound, create_hihat_sound, create_square_sound, create_triangle_sound, create_wood_block_sound};
 mod utlitites;
 
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +25,7 @@ enum SoundType {
     Hihat,
     Square,
     Triangle,
+    Woodblock
 }
 
 impl SoundType {
@@ -36,19 +37,21 @@ impl SoundType {
             SoundType::Cowbell => SoundType::Hihat,
             SoundType::Hihat => SoundType::Square,
             SoundType::Square => SoundType::Triangle,
-            SoundType::Triangle => SoundType::Beep,
+            SoundType::Triangle => SoundType::Woodblock,
+            SoundType::Woodblock => SoundType::Beep,
         }
     }
 
     fn prev(&self) -> Self {
         match self {
-            SoundType::Beep => SoundType::Triangle,
+            SoundType::Beep => SoundType::Woodblock,
             SoundType::Kick => SoundType::Beep,
             SoundType::Click => SoundType::Kick,
             SoundType::Cowbell => SoundType::Click,
             SoundType::Hihat => SoundType::Cowbell,
             SoundType::Square => SoundType::Hihat,
             SoundType::Triangle => SoundType::Square,
+            SoundType::Woodblock => SoundType::Triangle,
         }
     }
 
@@ -61,6 +64,7 @@ impl SoundType {
             SoundType::Hihat => "Hi-hat",
             SoundType::Square => "Square",
             SoundType::Triangle => "Triangle",
+            SoundType::Woodblock => "Woodblock",
         }
     }
 
@@ -73,6 +77,7 @@ impl SoundType {
             SoundType::Hihat => create_hihat_sound(),
             SoundType::Square => create_square_sound(),
             SoundType::Triangle => create_triangle_sound(),
+            SoundType::Woodblock => create_wood_block_sound(),
         }
     }
 }
@@ -158,9 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Left => adjust_bpm(&state, -1),
                             KeyCode::Char('+') => adjust_random_count(&state, 10),
                             KeyCode::Char('-') => adjust_random_count(&state, -10),
-                            KeyCode::Char('s') => cycle_sound(&state, true),  // Next sound
-                            KeyCode::Char('a') => cycle_sound(&state, false), // Previous sound
-                            KeyCode::Char('t') => test_current_sound(&state, &audio_tx), // Test current sound
+                            KeyCode::Char('s') => cycle_sound(&state, true),
+                            KeyCode::Char('a') => cycle_sound(&state, false),
+                            KeyCode::Char('t') => test_current_sound(&state, &audio_tx),
                             _ => {}
                         }
                     }
@@ -196,15 +201,12 @@ fn metronome_loop(
         };
         
         if should_tick {
-            // Send audio command with current sound
             let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
             last_tick = Instant::now();
             
-            // Update remaining ticks and handle randomization
             {
                 let mut state_guard = state.lock().unwrap();
                 if state_guard.random_mode {
-                    // Ensure remaining_ticks is initialized
                     if state_guard.remaining_ticks == 0 {
                         state_guard.remaining_ticks = state_guard.random_count;
                     }
@@ -212,7 +214,6 @@ fn metronome_loop(
                     state_guard.remaining_ticks -= 1;
                     
                     if state_guard.remaining_ticks == 0 {
-                        // Time to randomize BPM
                         let mut rng = rand::thread_rng();
                         state_guard.bpm = rng.gen_range(60..=200);
                         state_guard.remaining_ticks = state_guard.random_count;
@@ -220,7 +221,6 @@ fn metronome_loop(
                 }
             }
             
-            // Notify UI thread
             let _ = tick_tx.send(());
         }
         
@@ -239,7 +239,6 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
     
     println!("🎵 CLI METRONOME 🎵\n");
     
-    // Current BPM
     execute!(
         io::stdout(),
         SetForegroundColor(Color::Cyan),
@@ -247,7 +246,6 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
         ResetColor,
     )?;
     
-    // Current Sound
     execute!(
         io::stdout(),
         Print("Sound: "),
@@ -256,7 +254,6 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
         ResetColor,
     )?;
     
-    // Status
     let status = if state_guard.is_running { "RUNNING" } else { "STOPPED" };
     let status_color = if state_guard.is_running { Color::Green } else { Color::Red };
     
@@ -268,7 +265,6 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
         ResetColor,
     )?;
     
-    // Random mode info
     if state_guard.random_mode {
         execute!(
             io::stdout(),
@@ -313,7 +309,7 @@ fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::err
     println!("  Q         - Quit");
     
     println!("\n🔊 Available sounds:");
-    println!("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle");
+    println!("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock");
     
     println!("\n💡 Random mode will change BPM every {} ticks", state_guard.random_count);
     
@@ -326,7 +322,6 @@ fn toggle_metronome(state: &Arc<Mutex<MetronomeState>>) {
     let mut state_guard = state.lock().unwrap();
     state_guard.is_running = !state_guard.is_running;
     
-    // If starting in random mode, initialize remaining ticks
     if state_guard.is_running && state_guard.random_mode && state_guard.remaining_ticks == 0 {
         state_guard.remaining_ticks = state_guard.random_count;
     }
@@ -336,13 +331,11 @@ fn toggle_random_mode(state: &Arc<Mutex<MetronomeState>>) {
     let mut state_guard = state.lock().unwrap();
     state_guard.random_mode = !state_guard.random_mode;
     
-    // Initialize remaining ticks when turning on random mode, but only if metronome is running
     if state_guard.random_mode {
         if state_guard.is_running {
             state_guard.remaining_ticks = state_guard.random_count;
         }
     } else {
-        // Reset remaining ticks when turning off random mode
         state_guard.remaining_ticks = 0;
     }
 }
@@ -358,10 +351,7 @@ fn adjust_random_count(state: &Arc<Mutex<MetronomeState>>, change: i32) {
     let new_count = (state_guard.random_count as i32 + change).max(10).min(1000) as u32;
     state_guard.random_count = new_count;
     
-    // If random mode is active and metronome is running, update remaining ticks
     if state_guard.random_mode && state_guard.is_running {
-        // Only update if we're increasing the count and current remaining is less than new count
-        // This prevents resetting the countdown when you're in the middle of it
         if new_count > state_guard.remaining_ticks {
             state_guard.remaining_ticks = new_count;
         }
@@ -384,11 +374,3 @@ fn test_current_sound(state: &Arc<Mutex<MetronomeState>>, audio_tx: &mpsc::Sende
     };
     let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
 }
-
-// Cargo.toml dependencies needed:
-/*
-[dependencies]
-rodio = "0.17"
-crossterm = "0.27"
-rand = "0.8"
-*/
