@@ -9,7 +9,7 @@ use crossterm::{
     cursor,
     event::{poll, read, Event, KeyCode, KeyEventKind},
     execute,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetForegroundColor, SetBackgroundColor, Attribute, SetAttribute},
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use rand::Rng;
@@ -71,6 +71,19 @@ impl SoundType {
         }
     }
 
+    fn icon(&self) -> &'static str {
+        match self {
+            SoundType::Beep => "🔔",
+            SoundType::Kick => "🥁",
+            SoundType::Click => "🖱️",
+            SoundType::Cowbell => "🔔",
+            SoundType::Hihat => "🎺",
+            SoundType::Square => "⬜",
+            SoundType::Triangle => "🔺",
+            SoundType::Woodblock => "🪵",
+        }
+    }
+
     fn create_sound(&self) -> Vec<f32> {
         match self {
             SoundType::Beep => create_beep_sound(),
@@ -95,6 +108,7 @@ struct AtomicState {
     ui_dirty: AtomicBool,
     last_tick_time: AtomicU64,
     tick_count: AtomicU32,
+    volume: AtomicU32, // 0-100
 }
 
 impl AtomicState {
@@ -109,6 +123,7 @@ impl AtomicState {
             ui_dirty: AtomicBool::new(true),
             last_tick_time: AtomicU64::new(0),
             tick_count: AtomicU32::new(0),
+            volume: AtomicU32::new(80),
         }
     }
 
@@ -156,25 +171,17 @@ struct UICache {
     last_remaining_ticks: u32,
     last_random_count: u32,
     last_tick_count: u32,
+    last_volume: u32,
     first_render: bool,
-    bpm_buffer: String,
-    sound_buffer: String,
-    status_buffer: String,
-    ticks_buffer: String,
-    count_buffer: String,
     animation_buffer: String,
+    last_animation_frame: usize,
 }
 
 impl UICache {
     fn new() -> Self {
         Self {
             first_render: true,
-            bpm_buffer: String::with_capacity(8),
-            sound_buffer: String::with_capacity(16),
-            status_buffer: String::with_capacity(16),
-            ticks_buffer: String::with_capacity(32),
-            count_buffer: String::with_capacity(8),
-            animation_buffer: String::with_capacity(80),
+            animation_buffer: String::with_capacity(100),
             ..Default::default()
         }
     }
@@ -203,29 +210,73 @@ impl SoundCache {
     }
 }
 
-const HEADER_ROW: u16 = 0;
-const ANIMATION_ROW: u16 = 1;
-const BPM_ROW: u16 = 3;
-const SOUND_ROW: u16 = 4;
-const STATUS_ROW: u16 = 5;
-const RANDOM_MODE_ROW: u16 = 6;
-const REMAINING_TICKS_ROW: u16 = 7;
-const RANDOM_COUNT_ROW: u16 = 8;
-const CONTROLS_START_ROW: u16 = 10;
-const SOUNDS_LIST_ROW: u16 = 22;
-const TIP_ROW: u16 = 24;
+// Enhanced UI Layout Constants
+const TITLE_ROW: u16 = 1;
+const SUBTITLE_ROW: u16 = 2;
+const DIVIDER_ROW: u16 = 3;
+const MAIN_PANEL_START: u16 = 5;
+const ANIMATION_ROW: u16 = 6;
+const BPM_PANEL_ROW: u16 = 8;
+const SOUND_PANEL_ROW: u16 = 10;
+const STATUS_PANEL_ROW: u16 = 12;
+const RANDOM_PANEL_ROW: u16 = 14;
+const VOLUME_PANEL_ROW: u16 = 16;
+const CONTROLS_SECTION_START: u16 = 19;
+const CONTROLS_TITLE_ROW: u16 = 20;
+const CONTROLS_START_ROW: u16 = 21;
+const SOUNDS_SECTION_ROW: u16 = 32;
+const FOOTER_ROW: u16 = 35;
 
-fn generate_tick_animation(state: &Arc<AtomicState>) -> String {
-    const ANIMATION_WIDTH: usize = 60;
-    const TICK_SYMBOL: char = '♪';
-    const BAR_SYMBOL: char = '─';
+fn draw_box_border(writer: &mut BufWriter<Stdout>, x: u16, y: u16, width: u16, height: u16) -> Result<(), Box<dyn std::error::Error>> {
+    // Top border
+    execute!(writer, cursor::MoveTo(x, y), Print("+"))?;
+    for _ in 1..width-1 {
+        execute!(writer, Print("-"))?;
+    }
+    execute!(writer, Print("+"))?;
+    
+    // Side borders
+    for i in 1..height-1 {
+        execute!(writer, cursor::MoveTo(x, y + i), Print("|"))?;
+        execute!(writer, cursor::MoveTo(x + width - 1, y + i), Print("|"))?;
+    }
+    
+    // Bottom border
+    execute!(writer, cursor::MoveTo(x, y + height - 1), Print("+"))?;
+    for _ in 1..width-1 {
+        execute!(writer, Print("-"))?;
+    }
+    execute!(writer, Print("+"))?;
+    
+    Ok(())
+}
+
+fn create_progress_bar(progress: f64, width: usize, filled_char: char, empty_char: char) -> String {
+    let filled_width = (progress * width as f64) as usize;
+    let mut bar = String::with_capacity(width);
+    
+    for i in 0..width {
+        if i < filled_width {
+            bar.push(filled_char);
+        } else {
+            bar.push(empty_char);
+        }
+    }
+    bar
+}
+
+fn generate_enhanced_tick_animation(state: &Arc<AtomicState>) -> String {
+    const ANIMATION_WIDTH: usize = 70;
+    const PULSE_SYMBOLS: [char; 4] = ['♪', '♫', '♬', '♭'];
     
     let bpm = state.bpm.load(Ordering::Relaxed);
     let is_running = state.is_running.load(Ordering::Relaxed);
     let tick_count = state.tick_count.load(Ordering::Relaxed);
     
     if !is_running {
-        return format!("{:─<width$}", "", width = ANIMATION_WIDTH);
+        // Use ASCII characters to avoid UTF-8 boundary issues
+        let idle_pattern = "=".repeat(ANIMATION_WIDTH);
+        return format!("⏸️  {}", idle_pattern);
     }
     
     let elapsed = state.get_last_tick_elapsed();
@@ -237,43 +288,51 @@ fn generate_tick_animation(state: &Arc<AtomicState>) -> String {
         0.0
     };
     
-    let tick_pos = (progress * (ANIMATION_WIDTH - 1) as f64) as usize;
+    let mut animation = vec!['-'; ANIMATION_WIDTH];
     
-    let mut animation = vec![BAR_SYMBOL; ANIMATION_WIDTH];
-    
+    // Add measure markers
     let beats_per_measure = 4;
     let marker_spacing = ANIMATION_WIDTH / beats_per_measure;
     for i in 0..beats_per_measure {
         let pos = i * marker_spacing;
         if pos < ANIMATION_WIDTH {
-            animation[pos] = if (tick_count as usize / beats_per_measure) % 2 == 0 { '|' } else { '┃' };
+            let measure_num = (tick_count as usize / beats_per_measure) % 4;
+            animation[pos] = match measure_num {
+                0 => '|', // Strong beat
+                1 => ':', // Medium beat
+                2 => '|', // Strong beat
+                3 => ':', // Medium beat
+                _ => '|',
+            };
         }
     }
     
+    // Moving beat indicator
+    let tick_pos = (progress * (ANIMATION_WIDTH - 1) as f64) as usize;
     if tick_pos < ANIMATION_WIDTH {
-        animation[tick_pos] = TICK_SYMBOL;
+        let pulse_index = (tick_count as usize) % PULSE_SYMBOLS.len();
+        animation[tick_pos] = PULSE_SYMBOLS[pulse_index];
     }
     
-    let fade_duration = Duration::from_millis(200);
-    if elapsed < fade_duration {
-        let fade_progress = elapsed.as_millis() as f64 / fade_duration.as_millis() as f64;
-        let emphasis_size = ((1.0 - fade_progress) * 3.0) as usize;
+    // Beat emphasis effect
+    let emphasis_duration = Duration::from_millis(150);
+    if elapsed < emphasis_duration {
+        let fade_progress = elapsed.as_millis() as f64 / emphasis_duration.as_millis() as f64;
+        let intensity = ((1.0 - fade_progress) * 4.0) as usize;
         
-        for i in 0..=emphasis_size {
+        for i in 0..=intensity {
             if tick_pos >= i && tick_pos + i < ANIMATION_WIDTH {
                 if i == 0 {
-                    animation[tick_pos] = '♫';
-                } else {
-                    animation[tick_pos - i] = '◦';
-                    if tick_pos + i < ANIMATION_WIDTH {
-                        animation[tick_pos + i] = '◦';
-                    }
+                    animation[tick_pos] = '*';
+                } else if i <= 2 {
+                    if tick_pos >= i { animation[tick_pos - i] = 'o'; }
+                    if tick_pos + i < ANIMATION_WIDTH { animation[tick_pos + i] = 'o'; }
                 }
             }
         }
     }
     
-    animation.into_iter().collect()
+    format!("🎼 {}", animation.into_iter().collect::<String>())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -297,13 +356,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     enable_raw_mode()?;
-    execute!(io::stdout(), cursor::Hide)?;
+    execute!(io::stdout(), cursor::Hide, Clear(ClearType::All))?;
     
     let stdout = io::stdout();
     let mut buffered_stdout = BufWriter::new(stdout);
     
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16); // 60 FPS
     
     let mut input_check_time = Instant::now();
     const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(8);
@@ -315,7 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                               state.ui_dirty.load(Ordering::Relaxed);
         
         if should_update_ui {
-            display_ui_optimized(&state, &ui_cache, &mut buffered_stdout)?;
+            display_enhanced_ui(&state, &ui_cache, &mut buffered_stdout)?;
             state.ui_dirty.store(false, Ordering::Relaxed);
             last_ui_update = now;
         }
@@ -341,24 +400,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if key_event.kind == KeyEventKind::Press {
                             let mut needs_ui_update = true;
                             match key_event.code {
-                                KeyCode::Char('q') => {
+                                KeyCode::Char('q') | KeyCode::Esc => {
                                     let _ = audio_tx.send(AudioCommand::Stop);
                                     break;
                                 }
-                                KeyCode::Char(' ') => toggle_metronome(&state),
+                                KeyCode::Char(' ') | KeyCode::Enter => toggle_metronome(&state),
                                 KeyCode::Char('r') => toggle_random_mode(&state),
                                 KeyCode::Up => adjust_bpm(&state, 5),
                                 KeyCode::Down => adjust_bpm(&state, -5),
                                 KeyCode::Right => adjust_bpm(&state, 1),
                                 KeyCode::Left => adjust_bpm(&state, -1),
-                                KeyCode::Char('+') => adjust_random_count(&state, 10),
-                                KeyCode::Char('-') => adjust_random_count(&state, -10),
-                                KeyCode::Char('s') => cycle_sound(&state, true),
-                                KeyCode::Char('a') => cycle_sound(&state, false),
+                                KeyCode::Char('+') | KeyCode::Char('=') => adjust_random_count(&state, 10),
+                                KeyCode::Char('-') | KeyCode::Char('_') => adjust_random_count(&state, -10),
+                                KeyCode::Char('s') | KeyCode::Char('n') => cycle_sound(&state, true),
+                                KeyCode::Char('a') | KeyCode::Char('p') => cycle_sound(&state, false),
                                 KeyCode::Char('t') => {
                                     test_current_sound(&state, &sound_cache, &audio_tx);
                                     needs_ui_update = false;
                                 }
+                                KeyCode::Char('v') => adjust_volume(&state, 10),
+                                KeyCode::Char('c') => adjust_volume(&state, -10),
+                                KeyCode::F(1) => set_preset_bpm(&state, 60),   // Slow
+                                KeyCode::F(2) => set_preset_bpm(&state, 120),  // Medium
+                                KeyCode::F(3) => set_preset_bpm(&state, 180),  // Fast
+                                KeyCode::F(4) => set_preset_bpm(&state, 200),  // Very Fast
                                 _ => needs_ui_update = false,
                             }
                             
@@ -376,14 +441,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(1));
     }
     
-    execute!(buffered_stdout, cursor::Show)?;
+    execute!(buffered_stdout, cursor::Show, Clear(ClearType::All))?;
     buffered_stdout.flush()?;
     disable_raw_mode()?;
-    println!("\nMetronome stopped. Goodbye!");
+    
+    // Fancy goodbye message
+    println!("\n* ======================================= *");
+    println!("   Thank you for using CLI Metronome!");
+    println!("   Keep the rhythm alive! ♪");
+    println!("* ======================================= *\n");
+    
     Ok(())
 }
 
-fn display_ui_optimized(
+fn display_enhanced_ui(
     state: &Arc<AtomicState>, 
     ui_cache: &Arc<Mutex<UICache>>,
     writer: &mut BufWriter<Stdout>
@@ -397,75 +468,56 @@ fn display_ui_optimized(
     let current_remaining_ticks = state.remaining_ticks.load(Ordering::Relaxed);
     let current_random_count = state.random_count.load(Ordering::Relaxed);
     let current_tick_count = state.tick_count.load(Ordering::Relaxed);
+    let current_volume = state.volume.load(Ordering::Relaxed);
     
     if cache.first_render {
+        execute!(writer, Clear(ClearType::All))?;
+        
+        // Animated title with gradient effect
         execute!(
             writer,
-            Clear(ClearType::All),
-            cursor::MoveTo(0, HEADER_ROW),
+            cursor::MoveTo(25, TITLE_ROW),
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Magenta),
+            Print("🎵 ═══ "),
             SetForegroundColor(Color::Blue),
-            Print("🎵 CLI METRONOME 🎵"),
+            Print("CLI METRONOME STUDIO"),
+            SetForegroundColor(Color::Magenta),
+            Print(" ═══ 🎵"),
             ResetColor,
         )?;
         
-        execute!(writer, cursor::MoveTo(0, BPM_ROW), Print("BPM: "))?;
-        execute!(writer, cursor::MoveTo(0, SOUND_ROW), Print("Sound: "))?;
-        execute!(writer, cursor::MoveTo(0, STATUS_ROW), Print("Status: "))?;
-        execute!(writer, cursor::MoveTo(0, RANDOM_MODE_ROW), Print("Random mode: "))?;
-        execute!(writer, cursor::MoveTo(0, REMAINING_TICKS_ROW), Print("Remaining ticks: "))?;
-        execute!(writer, cursor::MoveTo(0, RANDOM_COUNT_ROW), Print("Random count: "))?;
-        
         execute!(
             writer,
-            cursor::MoveTo(0, CONTROLS_START_ROW),
-            SetForegroundColor(Color::Yellow),
-            Print("📋 CONTROLS:"),
+            cursor::MoveTo(30, SUBTITLE_ROW),
+            SetForegroundColor(Color::DarkGrey),
+            Print("♪ Professional Rhythm Training Tool ♪"),
             ResetColor,
         )?;
         
-        let controls = [
-            "  SPACE     - Start/Stop metronome",
-            "  R         - Toggle random mode",
-            "  ↑/↓       - Adjust BPM by 5",
-            "  ←/→       - Adjust BPM by 1",
-            "  +/-       - Adjust random count by 10",
-            "  S         - Next sound",
-            "  A         - Previous sound",
-            "  T         - Test current sound",
-            "  Q         - Quit",
-        ];
-        
-        for (i, control) in controls.iter().enumerate() {
-            execute!(
-                writer,
-                cursor::MoveTo(0, CONTROLS_START_ROW + 1 + i as u16),
-                Print(control),
-            )?;
-        }
-        
+        // Main divider
         execute!(
             writer,
-            cursor::MoveTo(0, SOUNDS_LIST_ROW),
+            cursor::MoveTo(10, DIVIDER_ROW),
             SetForegroundColor(Color::Cyan),
-            Print("🔊 Available sounds:"),
+            Print("==================================================================="),
             ResetColor,
-        )?;
-        execute!(
-            writer,
-            cursor::MoveTo(0, SOUNDS_LIST_ROW + 1),
-            Print("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock"),
         )?;
         
         cache.first_render = false;
     }
     
-    let animation = generate_tick_animation(state);
-    if animation != cache.animation_buffer || current_status != cache.last_status {
+    // Enhanced Beat Animation
+    let animation = generate_enhanced_tick_animation(state);
+    if animation != cache.animation_buffer {
         cache.animation_buffer = animation.clone();
+        
+        execute!(writer, cursor::MoveTo(5, ANIMATION_ROW))?;
+        draw_box_border(writer, 5, ANIMATION_ROW, 80, 3)?;
         
         execute!(
             writer,
-            cursor::MoveTo(0, ANIMATION_ROW),
+            cursor::MoveTo(7, ANIMATION_ROW + 1),
             Clear(ClearType::UntilNewLine),
         )?;
         
@@ -473,166 +525,262 @@ fn display_ui_optimized(
             execute!(
                 writer,
                 SetForegroundColor(Color::Green),
-                Print(&format!("🎼 {}", animation)),
+                SetAttribute(Attribute::Bold),
+                Print(&animation),
                 ResetColor,
             )?;
         } else {
             execute!(
                 writer,
                 SetForegroundColor(Color::DarkGrey),
-                Print(&format!("⏸  {}", animation)),
+                Print(&animation),
                 ResetColor,
             )?;
         }
     }
     
-    if current_bpm != cache.last_bpm {
-        cache.bpm_buffer.clear();
-        cache.bpm_buffer.push_str(&current_bpm.to_string());
+    // BPM Panel with visual meter
+    if current_bpm != cache.last_bpm || cache.first_render {
+        execute!(writer, cursor::MoveTo(10, BPM_PANEL_ROW))?;
+        draw_box_border(writer, 10, BPM_PANEL_ROW, 30, 4)?;
         
         execute!(
             writer,
-            cursor::MoveTo(5, BPM_ROW),
-            Clear(ClearType::UntilNewLine),
-            SetForegroundColor(Color::Cyan),
-            Print(&cache.bpm_buffer),
+            cursor::MoveTo(12, BPM_PANEL_ROW + 1),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print("⚡ BPM: "),
+            SetForegroundColor(Color::White),
+            Print(&format!("{:3}", current_bpm)),
             ResetColor,
         )?;
+        
+        // The BPM visual meter
+        let bpm_progress = (current_bpm - 30) as f64 / (300 - 30) as f64;
+        let meter = create_progress_bar(bpm_progress, 20, '#', '.');
+        execute!(
+            writer,
+            cursor::MoveTo(12, BPM_PANEL_ROW + 2),
+            SetForegroundColor(if current_bpm > 150 { Color::Red } else if current_bpm > 100 { Color::Yellow } else { Color::Green }),
+            Print(&meter),
+            ResetColor,
+        )?;
+        
         cache.last_bpm = current_bpm;
     }
     
-    if current_sound != cache.last_sound {
-        cache.sound_buffer.clear();
-        cache.sound_buffer.push_str(current_sound.name());
+    // Sound Panel
+    if current_sound != cache.last_sound || cache.first_render {
+        execute!(writer, cursor::MoveTo(45, BPM_PANEL_ROW))?;
+        draw_box_border(writer, 45, BPM_PANEL_ROW, 25, 4)?;
         
         execute!(
             writer,
-            cursor::MoveTo(7, SOUND_ROW),
-            Clear(ClearType::UntilNewLine),
+            cursor::MoveTo(47, BPM_PANEL_ROW + 1),
             SetForegroundColor(Color::Magenta),
-            Print(&cache.sound_buffer),
+            SetAttribute(Attribute::Bold),
+            Print("🔊 Sound: "),
             ResetColor,
         )?;
+        
+        execute!(
+            writer,
+            cursor::MoveTo(47, BPM_PANEL_ROW + 2),
+            SetForegroundColor(Color::White),
+            Print(&format!("{} {}", current_sound.icon(), current_sound.name())),
+            ResetColor,
+        )?;
+        
         cache.last_sound = current_sound;
     }
     
-    if current_status != cache.last_status {
-        cache.status_buffer.clear();
-        let (status_text, status_color) = if current_status {
-            (format!("RUNNING ♪ (Beat #{})", current_tick_count), Color::Green)
+    // Status Panel with beat counter
+    if current_status != cache.last_status || current_tick_count != cache.last_tick_count || cache.first_render {
+        execute!(writer, cursor::MoveTo(10, STATUS_PANEL_ROW))?;
+        draw_box_border(writer, 10, STATUS_PANEL_ROW, 35, 4)?;
+        
+        execute!(
+            writer,
+            cursor::MoveTo(12, STATUS_PANEL_ROW + 1),
+            SetAttribute(Attribute::Bold),
+        )?;
+        
+        if current_status {
+            let beats_per_measure = (current_tick_count % 4) + 1;
+            execute!(
+                writer,
+                SetForegroundColor(Color::Green),
+                Print(&format!("▶️  PLAYING • Beat #{} • {}/4", current_tick_count, beats_per_measure)),
+                ResetColor,
+            )?;
+            
+            // Beat dots visualization
+            execute!(writer, cursor::MoveTo(12, STATUS_PANEL_ROW + 2))?;
+            for i in 1..=4 {
+                if i <= beats_per_measure {
+                    execute!(writer, SetForegroundColor(Color::Green), Print("* "), ResetColor)?;
+                } else {
+                    execute!(writer, SetForegroundColor(Color::DarkGrey), Print("o "), ResetColor)?;
+                }
+            }
         } else {
-            (String::from("STOPPED"), Color::Red)
-        };
-        cache.status_buffer.push_str(&status_text);
+            execute!(
+                writer,
+                SetForegroundColor(Color::Red),
+                Print("⏹️  STOPPED"),
+                ResetColor,
+            )?;
+        }
         
-        execute!(
-            writer,
-            cursor::MoveTo(8, STATUS_ROW),
-            Clear(ClearType::UntilNewLine),
-            SetForegroundColor(status_color),
-            Print(&cache.status_buffer),
-            ResetColor,
-        )?;
         cache.last_status = current_status;
-    } else if current_status && current_tick_count != cache.last_tick_count {
-        cache.status_buffer.clear();
-        cache.status_buffer.push_str(&format!("RUNNING ♪ (Beat #{})", current_tick_count));
-        
-        execute!(
-            writer,
-            cursor::MoveTo(8, STATUS_ROW),
-            Clear(ClearType::UntilNewLine),
-            SetForegroundColor(Color::Green),
-            Print(&cache.status_buffer),
-            ResetColor,
-        )?;
         cache.last_tick_count = current_tick_count;
     }
     
-    if current_random_mode != cache.last_random_mode {
+    // Random Mode Panel
+    if current_random_mode != cache.last_random_mode || current_remaining_ticks != cache.last_remaining_ticks || cache.first_render {
+        execute!(writer, cursor::MoveTo(50, STATUS_PANEL_ROW))?;
+        draw_box_border(writer, 50, STATUS_PANEL_ROW, 30, 4)?;
+        
         execute!(
             writer,
-            cursor::MoveTo(13, RANDOM_MODE_ROW),
-            Clear(ClearType::UntilNewLine),
+            cursor::MoveTo(52, STATUS_PANEL_ROW + 1),
+            SetAttribute(Attribute::Bold),
         )?;
         
         if current_random_mode {
             execute!(
                 writer,
                 SetForegroundColor(Color::Yellow),
-                Print("🎲 ACTIVE"),
+                Print("🎲 RANDOM MODE"),
                 ResetColor,
             )?;
-        } else {
+            
             execute!(
                 writer,
-                SetForegroundColor(Color::DarkGrey),
-                Print("OFF"),
-                ResetColor,
-            )?;
-        }
-        cache.last_random_mode = current_random_mode;
-    }
-    
-    if current_remaining_ticks != cache.last_remaining_ticks {
-        cache.ticks_buffer.clear();
-        
-        execute!(
-            writer,
-            cursor::MoveTo(17, REMAINING_TICKS_ROW),
-            Clear(ClearType::UntilNewLine),
-        )?;
-        
-        if current_random_mode && current_status {
-            cache.ticks_buffer.push_str(&current_remaining_ticks.to_string());
-            execute!(
-                writer,
+                cursor::MoveTo(52, STATUS_PANEL_ROW + 2),
                 SetForegroundColor(Color::White),
-                Print(&cache.ticks_buffer),
-                ResetColor,
-            )?;
-        } else if current_random_mode && !current_status {
-            execute!(
-                writer,
-                SetForegroundColor(Color::DarkGrey),
-                Print("(Start to begin countdown)"),
+                Print(&format!("Next change: {} ticks", current_remaining_ticks)),
                 ResetColor,
             )?;
         } else {
             execute!(
                 writer,
                 SetForegroundColor(Color::DarkGrey),
-                Print("-"),
+                Print("🎯 FIXED BPM"),
                 ResetColor,
             )?;
         }
+        
+        cache.last_random_mode = current_random_mode;
         cache.last_remaining_ticks = current_remaining_ticks;
     }
     
-    if current_random_count != cache.last_random_count {
-        cache.count_buffer.clear();
-        cache.count_buffer.push_str(&current_random_count.to_string());
+    // Volume Panel
+    if current_volume != cache.last_volume || cache.first_render {
+        execute!(writer, cursor::MoveTo(10, VOLUME_PANEL_ROW))?;
+        draw_box_border(writer, 10, VOLUME_PANEL_ROW, 25, 4)?;
         
         execute!(
             writer,
-            cursor::MoveTo(15, RANDOM_COUNT_ROW),
-            Clear(ClearType::UntilNewLine),
-            Print(&cache.count_buffer),
+            cursor::MoveTo(12, VOLUME_PANEL_ROW + 1),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print(&format!("🔉 Volume: {}%", current_volume)),
+            ResetColor,
         )?;
-        cache.last_random_count = current_random_count;
+        
+        // Volume bar
+        let volume_progress = current_volume as f64 / 100.0;
+        let volume_bar = create_progress_bar(volume_progress, 15, '#', '.');
+        execute!(
+            writer,
+            cursor::MoveTo(12, VOLUME_PANEL_ROW + 2),
+            SetForegroundColor(Color::Cyan),
+            Print(&volume_bar),
+            ResetColor,
+        )?;
+        
+        cache.last_volume = current_volume;
     }
     
-    cache.ticks_buffer.clear();
-    cache.ticks_buffer.push_str(&format!("💡 Random mode changes BPM every {} ticks • Animation shows beat progress", current_random_count));
-    
-    execute!(
-        writer,
-        cursor::MoveTo(0, TIP_ROW),
-        Clear(ClearType::UntilNewLine),
-        SetForegroundColor(Color::DarkGrey),
-        Print(&cache.ticks_buffer),
-        ResetColor,
-    )?;
+    // Enhanced Controls Section
+    if cache.first_render {
+        execute!(
+            writer,
+            cursor::MoveTo(25, CONTROLS_TITLE_ROW),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print("🎹 ═══ CONTROL PANEL ═══ 🎹"),
+            ResetColor,
+        )?;
+        
+        let controls = [
+            ("⏯️  SPACE/ENTER", "Start/Stop metronome", Color::Green),
+            ("🎲 R", "Toggle random BPM mode", Color::Yellow),
+            ("⬆️⬇️ ↑/↓", "Adjust BPM by ±5", Color::Cyan),
+            ("⬅️➡️ ←/→", "Adjust BPM by ±1", Color::Cyan),
+            ("➕➖ +/-", "Adjust random count ±10", Color::Magenta),
+            ("🔊 S/N", "Next sound", Color::Blue),
+            ("🔉 A/P", "Previous sound", Color::Blue),
+            ("🧪 T", "Test current sound", Color::White),
+            ("🔊 V/C", "Volume up/down", Color::Cyan),
+            ("⚡ F1-F4", "BPM presets (60/120/180/200)", Color::Red),
+            ("❌ Q/ESC", "Quit application", Color::Red),
+        ];
+        
+        for (i, (key, desc, color)) in controls.iter().enumerate() {
+            execute!(
+                writer,
+                cursor::MoveTo(15, CONTROLS_START_ROW + i as u16),
+                SetForegroundColor(*color),
+                Print(&format!("{:15}", key)),
+                SetForegroundColor(Color::White),
+                Print(" - "),
+                SetForegroundColor(Color::DarkGrey),
+                Print(desc),
+                ResetColor,
+            )?;
+        }
+        
+        // Sound selection grid
+        execute!(
+            writer,
+            cursor::MoveTo(20, SOUNDS_SECTION_ROW),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print("🎵 ═══ AVAILABLE SOUNDS ═══ 🎵"),
+            ResetColor,
+        )?;
+        
+        let sounds_display = format!(
+            "  {} Beep  {} Kick  {} Click  {} Cowbell  {} Hi-hat  {} Square  {} Triangle  {} Woodblock",
+            SoundType::Beep.icon(),
+            SoundType::Kick.icon(),
+            SoundType::Click.icon(),
+            SoundType::Cowbell.icon(),
+            SoundType::Hihat.icon(),
+            SoundType::Square.icon(),
+            SoundType::Triangle.icon(),
+            SoundType::Woodblock.icon()
+        );
+        
+        execute!(
+            writer,
+            cursor::MoveTo(5, SOUNDS_SECTION_ROW + 1),
+            SetForegroundColor(Color::White),
+            Print(&sounds_display),
+            ResetColor,
+        )?;
+        
+        // Footer with tips
+        execute!(
+            writer,
+            cursor::MoveTo(15, FOOTER_ROW),
+            SetForegroundColor(Color::DarkGrey),
+            Print("💡 Pro tip: Use random mode for practice • F-keys for quick BPM presets • V/C for volume"),
+            ResetColor,
+        )?;
+    }
     
     writer.flush()?;
     Ok(())
@@ -668,7 +816,13 @@ fn metronome_loop(
             state.update_tick();
             
             let sound_type = state.get_sound_type();
-            let sound_data = sound_cache.get_sound(sound_type).clone();
+            let mut sound_data = sound_cache.get_sound(sound_type).clone();
+            
+            // Apply volume scaling
+            let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
+            for sample in &mut sound_data {
+                *sample *= volume;
+            }
             
             let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
             last_tick = Instant::now();
@@ -749,6 +903,18 @@ fn adjust_random_count(state: &Arc<AtomicState>, change: i32) {
     state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
+fn adjust_volume(state: &Arc<AtomicState>, change: i32) {
+    let current = state.volume.load(Ordering::Relaxed);
+    let new_volume = (current as i32 + change).max(0).min(100) as u32;
+    state.volume.store(new_volume, Ordering::Relaxed);
+    state.ui_dirty.store(true, Ordering::Relaxed);
+}
+
+fn set_preset_bpm(state: &Arc<AtomicState>, bpm: u32) {
+    state.bpm.store(bpm, Ordering::Relaxed);
+    state.ui_dirty.store(true, Ordering::Relaxed);
+}
+
 fn cycle_sound(state: &Arc<AtomicState>, forward: bool) {
     let current = state.get_sound_type();
     let new_sound = if forward { current.next() } else { current.prev() };
@@ -762,6 +928,13 @@ fn test_current_sound(
     audio_tx: &mpsc::Sender<AudioCommand>
 ) {
     let sound_type = state.get_sound_type();
-    let sound_data = sound_cache.get_sound(sound_type).clone();
+    let mut sound_data = sound_cache.get_sound(sound_type).clone();
+    
+    // Apply volume scaling
+    let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
+    for sample in &mut sound_data {
+        *sample *= volume;
+    }
+    
     let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
 }
