@@ -13,8 +13,11 @@ struct MetronomeApp {
     animation_progress: f32,
     beat_progress: f32,
     _stream: OutputStream,
+    #[allow(dead_code)]
     stream_handle: OutputStreamHandle,
+    #[allow(dead_code)]
     sound_cache: HashMap<u32, Vec<f32>>,
+    #[allow(dead_code)]
     sink: Arc<Mutex<Sink>>,
 }
 
@@ -101,7 +104,7 @@ impl Theme {
             primary: egui::Color32::from_rgb(138, 43, 226),     
             secondary: egui::Color32::from_rgb(75, 0, 130),     
             accent: egui::Color32::from_rgb(255, 140, 0),       
-            background: egui::Color32::from_rgb(18, 18, 18),    
+            background: egui::Color32::from_rgb(18, 18, 18),  
             surface: egui::Color32::from_rgb(32, 32, 32),       
             on_surface: egui::Color32::from_rgb(220, 220, 220), 
             error: egui::Color32::from_rgb(244, 67, 54),        
