@@ -3,8 +3,19 @@ name = "gui-metronome2"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "gui-metronome2"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[package.metadata.winres]
+subsystem = "windows"
+
 [dependencies]
 eframe = "0.29"
 egui = "0.29" 
 rodio = "0.19"
 rand = "0.8"
+

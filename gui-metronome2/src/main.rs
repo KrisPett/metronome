@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}, Mutex};
 use std::time::{Duration, Instant};
