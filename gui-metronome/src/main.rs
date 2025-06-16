@@ -78,6 +78,32 @@ impl SoundType {
     }
 }
 
+// Track what was last displayed to detect changes
+#[derive(Clone, Debug)]
+struct UIState {
+    last_bpm: u32,
+    last_sound: SoundType,
+    last_status: bool,
+    last_random_mode: bool,
+    last_remaining_ticks: u32,
+    last_random_count: u32,
+    first_render: bool,
+}
+
+impl Default for UIState {
+    fn default() -> Self {
+        Self {
+            last_bpm: 0,
+            last_sound: SoundType::Beep,
+            last_status: false,
+            last_random_mode: false,
+            last_remaining_ticks: 0,
+            last_random_count: 0,
+            first_render: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MetronomeState {
     bpm: u32,
@@ -87,6 +113,7 @@ struct MetronomeState {
     remaining_ticks: u32,
     sound_type: SoundType,
     ui_dirty: bool,
+    ui_state: UIState,
 }
 
 impl MetronomeState {
@@ -99,6 +126,7 @@ impl MetronomeState {
             remaining_ticks: 0,
             sound_type: SoundType::Kick,
             ui_dirty: true,
+            ui_state: UIState::default(),
         }
     }
 }
@@ -126,6 +154,18 @@ impl SoundCache {
     }
 }
 
+// UI Layout constants - define where each element appears
+const HEADER_ROW: u16 = 0;
+const BPM_ROW: u16 = 2;
+const SOUND_ROW: u16 = 3;
+const STATUS_ROW: u16 = 4;
+const RANDOM_MODE_ROW: u16 = 5;
+const REMAINING_TICKS_ROW: u16 = 6;
+const RANDOM_COUNT_ROW: u16 = 7;
+const CONTROLS_START_ROW: u16 = 9;
+const SOUNDS_LIST_ROW: u16 = 21;
+const TIP_ROW: u16 = 23;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(MetronomeState::new()));
     let sound_cache = Arc::new(SoundCache::new());
@@ -146,8 +186,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     enable_raw_mode()?;
+    
+    // Hide cursor for cleaner appearance
+    execute!(io::stdout(), cursor::Hide)?;
+    
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16); // 60 FPS
     
     loop {
         let should_update_ui = {
@@ -156,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         
         if should_update_ui {
-            display_ui(&state)?;
+            display_ui_dynamic(&state)?;
             {
                 let mut state_guard = state.lock().unwrap();
                 state_guard.ui_dirty = false;
@@ -179,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state_guard.ui_dirty = true;
         }
         
-        if poll(Duration::from_millis(16))? {
+        if poll(Duration::from_millis(1))? {
             match read()? {
                 Event::Key(key_event) => {
                     if key_event.kind == KeyEventKind::Press {
@@ -219,8 +263,209 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(1));
     }
     
+    // Restore cursor and clean up
+    execute!(io::stdout(), cursor::Show)?;
     disable_raw_mode()?;
     println!("\nMetronome stopped. Goodbye!");
+    Ok(())
+}
+
+fn display_ui_dynamic(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state_guard = state.lock().unwrap();
+    
+    // First time - draw the complete static layout
+    if state_guard.ui_state.first_render {
+        execute!(io::stdout(), Clear(ClearType::All))?;
+        
+        // Header
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, HEADER_ROW),
+            SetForegroundColor(Color::Blue),
+            Print("🎵 CLI METRONOME 🎵"),
+            ResetColor,
+        )?;
+        
+        // Static labels
+        execute!(io::stdout(), cursor::MoveTo(0, BPM_ROW), Print("BPM: "))?;
+        execute!(io::stdout(), cursor::MoveTo(0, SOUND_ROW), Print("Sound: "))?;
+        execute!(io::stdout(), cursor::MoveTo(0, STATUS_ROW), Print("Status: "))?;
+        execute!(io::stdout(), cursor::MoveTo(0, RANDOM_MODE_ROW), Print("Random mode: "))?;
+        execute!(io::stdout(), cursor::MoveTo(0, REMAINING_TICKS_ROW), Print("Remaining ticks: "))?;
+        execute!(io::stdout(), cursor::MoveTo(0, RANDOM_COUNT_ROW), Print("Random count: "))?;
+        
+        // Controls section
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, CONTROLS_START_ROW),
+            SetForegroundColor(Color::Yellow),
+            Print("📋 CONTROLS:"),
+            ResetColor,
+        )?;
+        
+        let controls = [
+            "  SPACE     - Start/Stop metronome",
+            "  R         - Toggle random mode",
+            "  ↑/↓       - Adjust BPM by 5",
+            "  ←/→       - Adjust BPM by 1",
+            "  +/-       - Adjust random count by 10",
+            "  S         - Next sound",
+            "  A         - Previous sound",
+            "  T         - Test current sound",
+            "  Q         - Quit",
+        ];
+        
+        for (i, control) in controls.iter().enumerate() {
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(0, CONTROLS_START_ROW + 1 + i as u16),
+                Print(control),
+            )?;
+        }
+        
+        // Sounds list
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, SOUNDS_LIST_ROW),
+            SetForegroundColor(Color::Cyan),
+            Print("🔊 Available sounds:"),
+            ResetColor,
+        )?;
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, SOUNDS_LIST_ROW + 1),
+            Print("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock"),
+        )?;
+        
+        state_guard.ui_state.first_render = false;
+    }
+    
+    // Update BPM if changed
+    if state_guard.bpm != state_guard.ui_state.last_bpm {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(5, BPM_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(Color::Cyan),
+            Print(format!("{}", state_guard.bpm)),
+            ResetColor,
+        )?;
+        state_guard.ui_state.last_bpm = state_guard.bpm;
+    }
+    
+    // Update sound if changed
+    if state_guard.sound_type != state_guard.ui_state.last_sound {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(7, SOUND_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(Color::Magenta),
+            Print(format!("{}", state_guard.sound_type.name())),
+            ResetColor,
+        )?;
+        state_guard.ui_state.last_sound = state_guard.sound_type;
+    }
+    
+    // Update status if changed
+    if state_guard.is_running != state_guard.ui_state.last_status {
+        let (status_text, status_color) = if state_guard.is_running {
+            ("RUNNING ♪", Color::Green)
+        } else {
+            ("STOPPED", Color::Red)
+        };
+        
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(8, STATUS_ROW),
+            Clear(ClearType::UntilNewLine),
+            SetForegroundColor(status_color),
+            Print(status_text),
+            ResetColor,
+        )?;
+        state_guard.ui_state.last_status = state_guard.is_running;
+    }
+    
+    // Update random mode if changed
+    if state_guard.random_mode != state_guard.ui_state.last_random_mode {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(13, RANDOM_MODE_ROW),
+            Clear(ClearType::UntilNewLine),
+        )?;
+        
+        if state_guard.random_mode {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::Yellow),
+                Print("🎲 ACTIVE"),
+                ResetColor,
+            )?;
+        } else {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print("OFF"),
+                ResetColor,
+            )?;
+        }
+        state_guard.ui_state.last_random_mode = state_guard.random_mode;
+    }
+    
+    // Update remaining ticks if changed (only show when random mode is active)
+    if state_guard.remaining_ticks != state_guard.ui_state.last_remaining_ticks {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(17, REMAINING_TICKS_ROW),
+            Clear(ClearType::UntilNewLine),
+        )?;
+        
+        if state_guard.random_mode && state_guard.is_running {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::White),
+                Print(format!("{}", state_guard.remaining_ticks)),
+                ResetColor,
+            )?;
+        } else if state_guard.random_mode && !state_guard.is_running {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print("(Start to begin countdown)"),
+                ResetColor,
+            )?;
+        } else {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print("-"),
+                ResetColor,
+            )?;
+        }
+        state_guard.ui_state.last_remaining_ticks = state_guard.remaining_ticks;
+    }
+    
+    // Update random count if changed
+    if state_guard.random_count != state_guard.ui_state.last_random_count {
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(15, RANDOM_COUNT_ROW),
+            Clear(ClearType::UntilNewLine),
+            Print(format!("{}", state_guard.random_count)),
+        )?;
+        state_guard.ui_state.last_random_count = state_guard.random_count;
+    }
+    
+    // Update tip text with current random count
+    execute!(
+        io::stdout(),
+        cursor::MoveTo(0, TIP_ROW),
+        Clear(ClearType::UntilNewLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("💡 Random mode changes BPM every {} ticks", state_guard.random_count)),
+        ResetColor,
+    )?;
+    
+    io::stdout().flush()?;
     Ok(())
 }
 
@@ -282,96 +527,6 @@ fn metronome_loop(
             thread::sleep(sleep_time);
         }
     }
-}
-
-fn display_ui(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::error::Error>> {
-    let state_guard = state.lock().unwrap();
-    
-    execute!(
-        io::stdout(),
-        Clear(ClearType::All),
-        cursor::MoveTo(0, 0),
-    )?;
-    
-    println!("🎵 CLI METRONOME 🎵\n");
-    
-    execute!(
-        io::stdout(),
-        SetForegroundColor(Color::Cyan),
-        Print(format!("BPM: {}\n", state_guard.bpm)),
-        ResetColor,
-    )?;
-    
-    execute!(
-        io::stdout(),
-        Print("Sound: "),
-        SetForegroundColor(Color::Magenta),
-        Print(format!("{}\n", state_guard.sound_type.name())),
-        ResetColor,
-    )?;
-    
-    let status = if state_guard.is_running { "RUNNING" } else { "STOPPED" };
-    let status_color = if state_guard.is_running { Color::Green } else { Color::Red };
-    
-    execute!(
-        io::stdout(),
-        Print("Status: "),
-        SetForegroundColor(status_color),
-        Print(format!("{}\n", status)),
-        ResetColor,
-    )?;
-    
-    if state_guard.random_mode {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(Color::Yellow),
-            Print("🎲 RANDOM MODE ACTIVE\n"),
-            ResetColor,
-        )?;
-        
-        if state_guard.is_running {
-            execute!(
-                io::stdout(),
-                Print(format!("Remaining ticks: {}\n", state_guard.remaining_ticks)),
-            )?;
-        } else {
-            execute!(
-                io::stdout(),
-                SetForegroundColor(Color::DarkGrey),
-                Print("(Start metronome to begin countdown)\n"),
-                ResetColor,
-            )?;
-        }
-        
-        println!("Random count setting: {}", state_guard.random_count);
-    } else {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(Color::DarkGrey),
-            Print("Random mode: OFF\n"),
-            ResetColor,
-        )?;
-    }
-    
-    println!("\n📋 CONTROLS:");
-    println!("  SPACE     - Start/Stop metronome");
-    println!("  R         - Toggle random mode");
-    println!("  ↑/↓       - Adjust BPM by 5");
-    println!("  ←/→       - Adjust BPM by 1");
-    println!("  +/-       - Adjust random count by 10");
-    println!("  S         - Next sound");
-    println!("  A         - Previous sound");
-    println!("  T         - Test current sound");
-    println!("  Q         - Quit");
-    
-    println!("\n🔊 Available sounds:");
-    println!("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock");
-    
-    println!("\n💡 Random mode will change BPM every {} ticks", state_guard.random_count);
-    
-    io::stdout().flush()?;
-    
-    Ok(())
 }
 
 fn toggle_metronome(state: &Arc<Mutex<MetronomeState>>) {
