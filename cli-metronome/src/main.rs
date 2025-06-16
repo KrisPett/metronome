@@ -86,7 +86,7 @@ struct MetronomeState {
     random_count: u32,
     remaining_ticks: u32,
     sound_type: SoundType,
-    ui_dirty: bool,  // Track if UI needs updating
+    ui_dirty: bool,
 }
 
 impl MetronomeState {
@@ -108,7 +108,6 @@ enum AudioCommand {
     Stop,
 }
 
-// Pre-generate and cache sounds for better performance
 struct SoundCache {
     sounds: HashMap<SoundType, Vec<f32>>,
 }
@@ -148,10 +147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     enable_raw_mode()?;
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(100); // Limit UI updates
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
     
     loop {
-        // Only update UI if it's dirty and enough time has passed
         let should_update_ui = {
             let state_guard = state.lock().unwrap();
             state_guard.ui_dirty && last_ui_update.elapsed() >= UI_UPDATE_INTERVAL
@@ -165,8 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             last_ui_update = Instant::now();
         }
-        
-        // Handle audio commands
+
         if let Ok(cmd) = audio_rx.try_recv() {
             match cmd {
                 AudioCommand::PlayTick(sound_data) => {
@@ -177,14 +174,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Handle tick updates
         if let Ok(_) = tick_rx.try_recv() {
             let mut state_guard = state.lock().unwrap();
             state_guard.ui_dirty = true;
         }
         
-        // Handle input with shorter poll timeout since we're limiting UI updates
-        if poll(Duration::from_millis(16))? { // ~60fps for input responsiveness
+        if poll(Duration::from_millis(16))? {
             match read()? {
                 Event::Key(key_event) => {
                     if key_event.kind == KeyEventKind::Press {
@@ -206,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('a') => cycle_sound(&state, false),
                             KeyCode::Char('t') => {
                                 test_current_sound(&state, &sound_cache, &audio_tx);
-                                needs_ui_update = false; // Testing sound doesn't change UI
+                                needs_ui_update = false;
                             }
                             _ => needs_ui_update = false,
                         }
@@ -221,7 +216,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Small sleep to prevent busy waiting
         thread::sleep(Duration::from_millis(1));
     }
     
@@ -237,18 +231,17 @@ fn metronome_loop(
     audio_tx: mpsc::Sender<AudioCommand>,
 ) {
     let mut last_tick = Instant::now();
-    let mut current_interval = Duration::from_millis(500); // Cache the interval
-    let mut rng = rand::thread_rng(); // Reuse RNG instance
+    let mut current_interval = Duration::from_millis(500);
+    let mut rng = rand::thread_rng();
     
     loop {
         let should_tick = {
             let state_guard = state.lock().unwrap();
             if !state_guard.is_running {
-                thread::sleep(Duration::from_millis(10)); // Longer sleep when not running
+                thread::sleep(Duration::from_millis(10));
                 continue;
             }
             
-            // Only recalculate interval if BPM changed
             let new_interval = Duration::from_millis(60000 / state_guard.bpm as u64);
             if new_interval != current_interval {
                 current_interval = new_interval;
@@ -258,7 +251,6 @@ fn metronome_loop(
         };
         
         if should_tick {
-            // Get cached sound data
             let sound_data = {
                 let state_guard = state.lock().unwrap();
                 sound_cache.get_sound(state_guard.sound_type).clone()
@@ -267,7 +259,6 @@ fn metronome_loop(
             let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
             last_tick = Instant::now();
             
-            // Handle random mode logic
             {
                 let mut state_guard = state.lock().unwrap();
                 if state_guard.random_mode {
@@ -286,7 +277,6 @@ fn metronome_loop(
             
             let _ = tick_tx.send(());
         } else {
-            // Calculate how long to sleep based on remaining time to next tick
             let time_to_next_tick = current_interval.saturating_sub(last_tick.elapsed());
             let sleep_time = time_to_next_tick.min(Duration::from_millis(5));
             thread::sleep(sleep_time);
