@@ -1,8 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, Write, BufWriter, Stdout};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rodio::{OutputStream, Sink};
 use crossterm::{
     cursor,
@@ -27,6 +28,12 @@ enum SoundType {
     Square,
     Triangle,
     Woodblock
+}
+
+impl Default for SoundType {
+    fn default() -> Self {
+        SoundType::Kick
+    }
 }
 
 impl SoundType {
@@ -78,9 +85,43 @@ impl SoundType {
     }
 }
 
-// Track what was last displayed to detect changes
-#[derive(Clone, Debug)]
-struct UIState {
+struct AtomicState {
+    bpm: AtomicU32,
+    is_running: AtomicBool,
+    random_mode: AtomicBool,
+    random_count: AtomicU32,
+    remaining_ticks: AtomicU32,
+    sound_type: AtomicU32,
+    ui_dirty: AtomicBool,
+}
+
+impl AtomicState {
+    fn new() -> Self {
+        Self {
+            bpm: AtomicU32::new(120),
+            is_running: AtomicBool::new(false),
+            random_mode: AtomicBool::new(false),
+            random_count: AtomicU32::new(100),
+            remaining_ticks: AtomicU32::new(0),
+            sound_type: AtomicU32::new(1),
+            ui_dirty: AtomicBool::new(true),
+        }
+    }
+
+    fn get_sound_type(&self) -> SoundType {
+        let index = self.sound_type.load(Ordering::Relaxed) as usize;
+        SoundType::ALL[index.min(SoundType::ALL.len() - 1)]
+    }
+
+    fn set_sound_type(&self, sound_type: SoundType) {
+        if let Some(index) = SoundType::ALL.iter().position(|&s| s == sound_type) {
+            self.sound_type.store(index as u32, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Default)]
+struct UICache {
     last_bpm: u32,
     last_sound: SoundType,
     last_status: bool,
@@ -88,45 +129,23 @@ struct UIState {
     last_remaining_ticks: u32,
     last_random_count: u32,
     first_render: bool,
+    bpm_buffer: String,
+    sound_buffer: String,
+    status_buffer: String,
+    ticks_buffer: String,
+    count_buffer: String,
 }
 
-impl Default for UIState {
-    fn default() -> Self {
-        Self {
-            last_bpm: 0,
-            last_sound: SoundType::Beep,
-            last_status: false,
-            last_random_mode: false,
-            last_remaining_ticks: 0,
-            last_random_count: 0,
-            first_render: true,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct MetronomeState {
-    bpm: u32,
-    is_running: bool,
-    random_mode: bool,
-    random_count: u32,
-    remaining_ticks: u32,
-    sound_type: SoundType,
-    ui_dirty: bool,
-    ui_state: UIState,
-}
-
-impl MetronomeState {
+impl UICache {
     fn new() -> Self {
         Self {
-            bpm: 120,
-            is_running: false,
-            random_mode: false,
-            random_count: 100,
-            remaining_ticks: 0,
-            sound_type: SoundType::Kick,
-            ui_dirty: true,
-            ui_state: UIState::default(),
+            first_render: true,
+            bpm_buffer: String::with_capacity(8),
+            sound_buffer: String::with_capacity(16),
+            status_buffer: String::with_capacity(16),
+            ticks_buffer: String::with_capacity(32),
+            count_buffer: String::with_capacity(8),
+            ..Default::default()
         }
     }
 }
@@ -154,7 +173,6 @@ impl SoundCache {
     }
 }
 
-// UI Layout constants - define where each element appears
 const HEADER_ROW: u16 = 0;
 const BPM_ROW: u16 = 2;
 const SOUND_ROW: u16 = 3;
@@ -167,8 +185,9 @@ const SOUNDS_LIST_ROW: u16 = 21;
 const TIP_ROW: u16 = 23;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(Mutex::new(MetronomeState::new()));
+    let state = Arc::new(AtomicState::new());
     let sound_cache = Arc::new(SoundCache::new());
+    let ui_cache = Arc::new(Mutex::new(UICache::new()));
     
     let (tick_tx, tick_rx) = mpsc::channel();
     let (audio_tx, audio_rx) = mpsc::channel::<AudioCommand>();
@@ -186,26 +205,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     enable_raw_mode()?;
-    
-    // Hide cursor for cleaner appearance
     execute!(io::stdout(), cursor::Hide)?;
     
+    let stdout = io::stdout();
+    let mut buffered_stdout = BufWriter::new(stdout);
+    
     let mut last_ui_update = Instant::now();
-    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(16); // 60 FPS
+    const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(33);
+    
+    let mut input_check_time = Instant::now();
+    const INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(8);
     
     loop {
-        let should_update_ui = {
-            let state_guard = state.lock().unwrap();
-            state_guard.ui_dirty && last_ui_update.elapsed() >= UI_UPDATE_INTERVAL
-        };
+        let now = Instant::now();
+        
+        let should_update_ui = state.ui_dirty.load(Ordering::Relaxed) && 
+                              now.duration_since(last_ui_update) >= UI_UPDATE_INTERVAL;
         
         if should_update_ui {
-            display_ui_dynamic(&state)?;
-            {
-                let mut state_guard = state.lock().unwrap();
-                state_guard.ui_dirty = false;
-            }
-            last_ui_update = Instant::now();
+            display_ui_optimized(&state, &ui_cache, &mut buffered_stdout)?;
+            state.ui_dirty.store(false, Ordering::Relaxed);
+            last_ui_update = now;
         }
 
         if let Ok(cmd) = audio_rx.try_recv() {
@@ -219,84 +239,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         if let Ok(_) = tick_rx.try_recv() {
-            let mut state_guard = state.lock().unwrap();
-            state_guard.ui_dirty = true;
+            state.ui_dirty.store(true, Ordering::Relaxed);
         }
         
-        if poll(Duration::from_millis(1))? {
-            match read()? {
-                Event::Key(key_event) => {
-                    if key_event.kind == KeyEventKind::Press {
-                        let mut needs_ui_update = true;
-                        match key_event.code {
-                            KeyCode::Char('q') => {
-                                let _ = audio_tx.send(AudioCommand::Stop);
-                                break;
+        if now.duration_since(input_check_time) >= INPUT_CHECK_INTERVAL {
+            if poll(Duration::from_millis(0))? {
+                match read()? {
+                    Event::Key(key_event) => {
+                        if key_event.kind == KeyEventKind::Press {
+                            let mut needs_ui_update = true;
+                            match key_event.code {
+                                KeyCode::Char('q') => {
+                                    let _ = audio_tx.send(AudioCommand::Stop);
+                                    break;
+                                }
+                                KeyCode::Char(' ') => toggle_metronome(&state),
+                                KeyCode::Char('r') => toggle_random_mode(&state),
+                                KeyCode::Up => adjust_bpm(&state, 5),
+                                KeyCode::Down => adjust_bpm(&state, -5),
+                                KeyCode::Right => adjust_bpm(&state, 1),
+                                KeyCode::Left => adjust_bpm(&state, -1),
+                                KeyCode::Char('+') => adjust_random_count(&state, 10),
+                                KeyCode::Char('-') => adjust_random_count(&state, -10),
+                                KeyCode::Char('s') => cycle_sound(&state, true),
+                                KeyCode::Char('a') => cycle_sound(&state, false),
+                                KeyCode::Char('t') => {
+                                    test_current_sound(&state, &sound_cache, &audio_tx);
+                                    needs_ui_update = false;
+                                }
+                                _ => needs_ui_update = false,
                             }
-                            KeyCode::Char(' ') => toggle_metronome(&state),
-                            KeyCode::Char('r') => toggle_random_mode(&state),
-                            KeyCode::Up => adjust_bpm(&state, 5),
-                            KeyCode::Down => adjust_bpm(&state, -5),
-                            KeyCode::Right => adjust_bpm(&state, 1),
-                            KeyCode::Left => adjust_bpm(&state, -1),
-                            KeyCode::Char('+') => adjust_random_count(&state, 10),
-                            KeyCode::Char('-') => adjust_random_count(&state, -10),
-                            KeyCode::Char('s') => cycle_sound(&state, true),
-                            KeyCode::Char('a') => cycle_sound(&state, false),
-                            KeyCode::Char('t') => {
-                                test_current_sound(&state, &sound_cache, &audio_tx);
-                                needs_ui_update = false;
+                            
+                            if needs_ui_update {
+                                state.ui_dirty.store(true, Ordering::Relaxed);
                             }
-                            _ => needs_ui_update = false,
-                        }
-                        
-                        if needs_ui_update {
-                            let mut state_guard = state.lock().unwrap();
-                            state_guard.ui_dirty = true;
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
+            input_check_time = now;
         }
         
         thread::sleep(Duration::from_millis(1));
     }
     
-    // Restore cursor and clean up
-    execute!(io::stdout(), cursor::Show)?;
+    execute!(buffered_stdout, cursor::Show)?;
+    buffered_stdout.flush()?;
     disable_raw_mode()?;
     println!("\nMetronome stopped. Goodbye!");
     Ok(())
 }
 
-fn display_ui_dynamic(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state_guard = state.lock().unwrap();
+fn display_ui_optimized(
+    state: &Arc<AtomicState>, 
+    ui_cache: &Arc<Mutex<UICache>>,
+    writer: &mut BufWriter<Stdout>
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache = ui_cache.lock().unwrap();
     
-    // First time - draw the complete static layout
-    if state_guard.ui_state.first_render {
-        execute!(io::stdout(), Clear(ClearType::All))?;
-        
-        // Header
+    // Load all atomic values once
+    let current_bpm = state.bpm.load(Ordering::Relaxed);
+    let current_sound = state.get_sound_type();
+    let current_status = state.is_running.load(Ordering::Relaxed);
+    let current_random_mode = state.random_mode.load(Ordering::Relaxed);
+    let current_remaining_ticks = state.remaining_ticks.load(Ordering::Relaxed);
+    let current_random_count = state.random_count.load(Ordering::Relaxed);
+    
+    if cache.first_render {
         execute!(
-            io::stdout(),
+            writer,
+            Clear(ClearType::All),
             cursor::MoveTo(0, HEADER_ROW),
             SetForegroundColor(Color::Blue),
             Print("🎵 CLI METRONOME 🎵"),
             ResetColor,
         )?;
         
-        // Static labels
-        execute!(io::stdout(), cursor::MoveTo(0, BPM_ROW), Print("BPM: "))?;
-        execute!(io::stdout(), cursor::MoveTo(0, SOUND_ROW), Print("Sound: "))?;
-        execute!(io::stdout(), cursor::MoveTo(0, STATUS_ROW), Print("Status: "))?;
-        execute!(io::stdout(), cursor::MoveTo(0, RANDOM_MODE_ROW), Print("Random mode: "))?;
-        execute!(io::stdout(), cursor::MoveTo(0, REMAINING_TICKS_ROW), Print("Remaining ticks: "))?;
-        execute!(io::stdout(), cursor::MoveTo(0, RANDOM_COUNT_ROW), Print("Random count: "))?;
+        execute!(writer, cursor::MoveTo(0, BPM_ROW), Print("BPM: "))?;
+        execute!(writer, cursor::MoveTo(0, SOUND_ROW), Print("Sound: "))?;
+        execute!(writer, cursor::MoveTo(0, STATUS_ROW), Print("Status: "))?;
+        execute!(writer, cursor::MoveTo(0, RANDOM_MODE_ROW), Print("Random mode: "))?;
+        execute!(writer, cursor::MoveTo(0, REMAINING_TICKS_ROW), Print("Remaining ticks: "))?;
+        execute!(writer, cursor::MoveTo(0, RANDOM_COUNT_ROW), Print("Random count: "))?;
         
-        // Controls section
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(0, CONTROLS_START_ROW),
             SetForegroundColor(Color::Yellow),
             Print("📋 CONTROLS:"),
@@ -317,160 +345,169 @@ fn display_ui_dynamic(state: &Arc<Mutex<MetronomeState>>) -> Result<(), Box<dyn 
         
         for (i, control) in controls.iter().enumerate() {
             execute!(
-                io::stdout(),
+                writer,
                 cursor::MoveTo(0, CONTROLS_START_ROW + 1 + i as u16),
                 Print(control),
             )?;
         }
         
-        // Sounds list
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(0, SOUNDS_LIST_ROW),
             SetForegroundColor(Color::Cyan),
             Print("🔊 Available sounds:"),
             ResetColor,
         )?;
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(0, SOUNDS_LIST_ROW + 1),
             Print("  Beep • Kick • Click • Cowbell • Hi-hat • Square • Triangle • Woodblock"),
         )?;
         
-        state_guard.ui_state.first_render = false;
+        cache.first_render = false;
     }
     
-    // Update BPM if changed
-    if state_guard.bpm != state_guard.ui_state.last_bpm {
+    if current_bpm != cache.last_bpm {
+        cache.bpm_buffer.clear();
+        cache.bpm_buffer.push_str(&current_bpm.to_string());
+        
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(5, BPM_ROW),
             Clear(ClearType::UntilNewLine),
             SetForegroundColor(Color::Cyan),
-            Print(format!("{}", state_guard.bpm)),
+            Print(&cache.bpm_buffer),
             ResetColor,
         )?;
-        state_guard.ui_state.last_bpm = state_guard.bpm;
+        cache.last_bpm = current_bpm;
     }
     
-    // Update sound if changed
-    if state_guard.sound_type != state_guard.ui_state.last_sound {
+    if current_sound != cache.last_sound {
+        cache.sound_buffer.clear();
+        cache.sound_buffer.push_str(current_sound.name());
+        
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(7, SOUND_ROW),
             Clear(ClearType::UntilNewLine),
             SetForegroundColor(Color::Magenta),
-            Print(format!("{}", state_guard.sound_type.name())),
+            Print(&cache.sound_buffer),
             ResetColor,
         )?;
-        state_guard.ui_state.last_sound = state_guard.sound_type;
+        cache.last_sound = current_sound;
     }
     
-    // Update status if changed
-    if state_guard.is_running != state_guard.ui_state.last_status {
-        let (status_text, status_color) = if state_guard.is_running {
+    if current_status != cache.last_status {
+        cache.status_buffer.clear();
+        let (status_text, status_color) = if current_status {
             ("RUNNING ♪", Color::Green)
         } else {
             ("STOPPED", Color::Red)
         };
+        cache.status_buffer.push_str(status_text);
         
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(8, STATUS_ROW),
             Clear(ClearType::UntilNewLine),
             SetForegroundColor(status_color),
-            Print(status_text),
+            Print(&cache.status_buffer),
             ResetColor,
         )?;
-        state_guard.ui_state.last_status = state_guard.is_running;
+        cache.last_status = current_status;
     }
     
-    // Update random mode if changed
-    if state_guard.random_mode != state_guard.ui_state.last_random_mode {
+    if current_random_mode != cache.last_random_mode {
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(13, RANDOM_MODE_ROW),
             Clear(ClearType::UntilNewLine),
         )?;
         
-        if state_guard.random_mode {
+        if current_random_mode {
             execute!(
-                io::stdout(),
+                writer,
                 SetForegroundColor(Color::Yellow),
                 Print("🎲 ACTIVE"),
                 ResetColor,
             )?;
         } else {
             execute!(
-                io::stdout(),
+                writer,
                 SetForegroundColor(Color::DarkGrey),
                 Print("OFF"),
                 ResetColor,
             )?;
         }
-        state_guard.ui_state.last_random_mode = state_guard.random_mode;
+        cache.last_random_mode = current_random_mode;
     }
     
-    // Update remaining ticks if changed (only show when random mode is active)
-    if state_guard.remaining_ticks != state_guard.ui_state.last_remaining_ticks {
+    if current_remaining_ticks != cache.last_remaining_ticks {
+        cache.ticks_buffer.clear();
+        
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(17, REMAINING_TICKS_ROW),
             Clear(ClearType::UntilNewLine),
         )?;
         
-        if state_guard.random_mode && state_guard.is_running {
+        if current_random_mode && current_status {
+            cache.ticks_buffer.push_str(&current_remaining_ticks.to_string());
             execute!(
-                io::stdout(),
+                writer,
                 SetForegroundColor(Color::White),
-                Print(format!("{}", state_guard.remaining_ticks)),
+                Print(&cache.ticks_buffer),
                 ResetColor,
             )?;
-        } else if state_guard.random_mode && !state_guard.is_running {
+        } else if current_random_mode && !current_status {
             execute!(
-                io::stdout(),
+                writer,
                 SetForegroundColor(Color::DarkGrey),
                 Print("(Start to begin countdown)"),
                 ResetColor,
             )?;
         } else {
             execute!(
-                io::stdout(),
+                writer,
                 SetForegroundColor(Color::DarkGrey),
                 Print("-"),
                 ResetColor,
             )?;
         }
-        state_guard.ui_state.last_remaining_ticks = state_guard.remaining_ticks;
+        cache.last_remaining_ticks = current_remaining_ticks;
     }
     
-    // Update random count if changed
-    if state_guard.random_count != state_guard.ui_state.last_random_count {
+    if current_random_count != cache.last_random_count {
+        cache.count_buffer.clear();
+        cache.count_buffer.push_str(&current_random_count.to_string());
+        
         execute!(
-            io::stdout(),
+            writer,
             cursor::MoveTo(15, RANDOM_COUNT_ROW),
             Clear(ClearType::UntilNewLine),
-            Print(format!("{}", state_guard.random_count)),
+            Print(&cache.count_buffer),
         )?;
-        state_guard.ui_state.last_random_count = state_guard.random_count;
+        cache.last_random_count = current_random_count;
     }
     
-    // Update tip text with current random count
+    cache.ticks_buffer.clear();
+    cache.ticks_buffer.push_str(&format!("💡 Random mode changes BPM every {} ticks", current_random_count));
+    
     execute!(
-        io::stdout(),
+        writer,
         cursor::MoveTo(0, TIP_ROW),
         Clear(ClearType::UntilNewLine),
         SetForegroundColor(Color::DarkGrey),
-        Print(format!("💡 Random mode changes BPM every {} ticks", state_guard.random_count)),
+        Print(&cache.ticks_buffer),
         ResetColor,
     )?;
     
-    io::stdout().flush()?;
+    writer.flush()?;
     Ok(())
 }
 
 fn metronome_loop(
-    state: Arc<Mutex<MetronomeState>>,
+    state: Arc<AtomicState>,
     sound_cache: Arc<SoundCache>,
     tick_tx: mpsc::Sender<()>,
     audio_tx: mpsc::Sender<AudioCommand>,
@@ -481,13 +518,13 @@ fn metronome_loop(
     
     loop {
         let should_tick = {
-            let state_guard = state.lock().unwrap();
-            if !state_guard.is_running {
-                thread::sleep(Duration::from_millis(10));
+            if !state.is_running.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5)); // Shorter sleep when stopped
                 continue;
             }
             
-            let new_interval = Duration::from_millis(60000 / state_guard.bpm as u64);
+            let bpm = state.bpm.load(Ordering::Relaxed);
+            let new_interval = Duration::from_millis(60000 / bpm as u64);
             if new_interval != current_interval {
                 current_interval = new_interval;
             }
@@ -496,96 +533,96 @@ fn metronome_loop(
         };
         
         if should_tick {
-            let sound_data = {
-                let state_guard = state.lock().unwrap();
-                sound_cache.get_sound(state_guard.sound_type).clone()
-            };
+            let sound_type = state.get_sound_type();
+            let sound_data = sound_cache.get_sound(sound_type).clone();
             
             let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
             last_tick = Instant::now();
             
-            {
-                let mut state_guard = state.lock().unwrap();
-                if state_guard.random_mode {
-                    if state_guard.remaining_ticks == 0 {
-                        state_guard.remaining_ticks = state_guard.random_count;
-                    }
-                    
-                    state_guard.remaining_ticks -= 1;
-                    
-                    if state_guard.remaining_ticks == 0 {
-                        state_guard.bpm = rng.gen_range(60..=200);
-                        state_guard.remaining_ticks = state_guard.random_count;
-                    }
+            if state.random_mode.load(Ordering::Relaxed) {
+                let mut remaining = state.remaining_ticks.load(Ordering::Relaxed);
+                if remaining == 0 {
+                    remaining = state.random_count.load(Ordering::Relaxed);
+                }
+                
+                remaining -= 1;
+                state.remaining_ticks.store(remaining, Ordering::Relaxed);
+                
+                if remaining == 0 {
+                    let new_bpm = rng.gen_range(60..=200);
+                    state.bpm.store(new_bpm, Ordering::Relaxed);
+                    state.remaining_ticks.store(state.random_count.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
             }
             
             let _ = tick_tx.send(());
         } else {
             let time_to_next_tick = current_interval.saturating_sub(last_tick.elapsed());
-            let sleep_time = time_to_next_tick.min(Duration::from_millis(5));
+            let sleep_time = time_to_next_tick.min(Duration::from_millis(2));
             thread::sleep(sleep_time);
         }
     }
 }
 
-fn toggle_metronome(state: &Arc<Mutex<MetronomeState>>) {
-    let mut state_guard = state.lock().unwrap();
-    state_guard.is_running = !state_guard.is_running;
+fn toggle_metronome(state: &Arc<AtomicState>) {
+    let was_running = state.is_running.load(Ordering::Relaxed);
+    state.is_running.store(!was_running, Ordering::Relaxed);
     
-    if state_guard.is_running && state_guard.random_mode && state_guard.remaining_ticks == 0 {
-        state_guard.remaining_ticks = state_guard.random_count;
+    if !was_running && state.random_mode.load(Ordering::Relaxed) && 
+       state.remaining_ticks.load(Ordering::Relaxed) == 0 {
+        state.remaining_ticks.store(state.random_count.load(Ordering::Relaxed), Ordering::Relaxed);
     }
+    state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
-fn toggle_random_mode(state: &Arc<Mutex<MetronomeState>>) {
-    let mut state_guard = state.lock().unwrap();
-    state_guard.random_mode = !state_guard.random_mode;
+fn toggle_random_mode(state: &Arc<AtomicState>) {
+    let was_random = state.random_mode.load(Ordering::Relaxed);
+    state.random_mode.store(!was_random, Ordering::Relaxed);
     
-    if state_guard.random_mode {
-        if state_guard.is_running {
-            state_guard.remaining_ticks = state_guard.random_count;
+    if !was_random {
+        if state.is_running.load(Ordering::Relaxed) {
+            state.remaining_ticks.store(state.random_count.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     } else {
-        state_guard.remaining_ticks = 0;
+        state.remaining_ticks.store(0, Ordering::Relaxed);
     }
+    state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
-fn adjust_bpm(state: &Arc<Mutex<MetronomeState>>, change: i32) {
-    let mut state_guard = state.lock().unwrap();
-    let new_bpm = (state_guard.bpm as i32 + change).max(30).min(300) as u32;
-    state_guard.bpm = new_bpm;
+fn adjust_bpm(state: &Arc<AtomicState>, change: i32) {
+    let current = state.bpm.load(Ordering::Relaxed);
+    let new_bpm = (current as i32 + change).max(30).min(300) as u32;
+    state.bpm.store(new_bpm, Ordering::Relaxed);
+    state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
-fn adjust_random_count(state: &Arc<Mutex<MetronomeState>>, change: i32) {
-    let mut state_guard = state.lock().unwrap();
-    let new_count = (state_guard.random_count as i32 + change).max(10).min(1000) as u32;
-    state_guard.random_count = new_count;
+fn adjust_random_count(state: &Arc<AtomicState>, change: i32) {
+    let current = state.random_count.load(Ordering::Relaxed);
+    let new_count = (current as i32 + change).max(10).min(1000) as u32;
+    state.random_count.store(new_count, Ordering::Relaxed);
     
-    if state_guard.random_mode && state_guard.is_running {
-        if new_count > state_guard.remaining_ticks {
-            state_guard.remaining_ticks = new_count;
+    if state.random_mode.load(Ordering::Relaxed) && state.is_running.load(Ordering::Relaxed) {
+        let remaining = state.remaining_ticks.load(Ordering::Relaxed);
+        if new_count > remaining {
+            state.remaining_ticks.store(new_count, Ordering::Relaxed);
         }
     }
+    state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
-fn cycle_sound(state: &Arc<Mutex<MetronomeState>>, forward: bool) {
-    let mut state_guard = state.lock().unwrap();
-    state_guard.sound_type = if forward {
-        state_guard.sound_type.next()
-    } else {
-        state_guard.sound_type.prev()
-    };
+fn cycle_sound(state: &Arc<AtomicState>, forward: bool) {
+    let current = state.get_sound_type();
+    let new_sound = if forward { current.next() } else { current.prev() };
+    state.set_sound_type(new_sound);
+    state.ui_dirty.store(true, Ordering::Relaxed);
 }
 
 fn test_current_sound(
-    state: &Arc<Mutex<MetronomeState>>, 
+    state: &Arc<AtomicState>, 
     sound_cache: &Arc<SoundCache>,
     audio_tx: &mpsc::Sender<AudioCommand>
 ) {
-    let sound_data = {
-        let state_guard = state.lock().unwrap();
-        sound_cache.get_sound(state_guard.sound_type).clone()
-    };
+    let sound_type = state.get_sound_type();
+    let sound_data = sound_cache.get_sound(sound_type).clone();
     let _ = audio_tx.send(AudioCommand::PlayTick(sound_data));
 }
