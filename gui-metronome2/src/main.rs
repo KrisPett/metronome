@@ -16,6 +16,7 @@ mod utilities;
 use crate::utilities::sound::{
     create_beep_sound, create_click_sound, create_cowbell_sound, create_hihat_sound,
     create_kick_sound, create_square_sound, create_triangle_sound, create_wood_block_sound,
+    create_celebration_sound
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -144,49 +145,6 @@ struct CountdownState {
     enable_random_bpm: bool,
     original_bpm: u32,
     next_bpm_change: f32,
-}
-
-// Helper function to create celebration sound
-fn create_celebration_sound() -> Vec<f32> {
-    let sample_rate = 44100;
-    let duration = 2.0; // 2 seconds
-    let mut samples = Vec::new();
-    
-    // Create a celebratory chord progression
-    let frequencies = [
-        [523.25, 659.25, 783.99], // C major chord
-        [587.33, 739.99, 880.0],  // D major chord
-        [659.25, 830.61, 987.77], // E major chord
-        [698.46, 880.0, 1046.5],  // F major chord
-    ];
-    
-    for chord_idx in 0..frequencies.len() {
-        let chord_duration = duration / frequencies.len() as f32;
-        let chord_samples = (sample_rate as f32 * chord_duration) as usize;
-        
-        for i in 0..chord_samples {
-            let t = i as f32 / sample_rate as f32;
-            let mut sample = 0.0;
-            
-            // Add each note in the chord
-            for &freq in &frequencies[chord_idx] {
-                sample += (t * freq * 2.0 * PI).sin() * 0.2;
-            }
-            
-            // Add some envelope
-            let envelope = if t < 0.1 {
-                t / 0.1
-            } else if t > chord_duration - 0.1 {
-                (chord_duration - t) / 0.1
-            } else {
-                1.0
-            };
-            
-            samples.push(sample * envelope);
-        }
-    }
-    
-    samples
 }
 
 impl Default for MetronomeApp {
@@ -480,7 +438,8 @@ fn metronome_thread(
                 
                 // Handle random BPM changes during countdown
                 if local_countdown_state.enable_random_bpm {
-                    local_countdown_state.next_bpm_change -= elapsed - (local_countdown_state.duration_seconds as f32 - local_countdown_state.remaining_seconds);
+                    // Decrease the timer
+                    local_countdown_state.next_bpm_change -= 0.001; // Subtract 1ms each iteration
                     
                     if local_countdown_state.next_bpm_change <= 0.0 {
                         let mut rng = rand::thread_rng();

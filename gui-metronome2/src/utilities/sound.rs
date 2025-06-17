@@ -151,3 +151,45 @@ pub fn create_beep_sound() -> Vec<f32> {
     }
     wave
 }
+
+pub fn create_celebration_sound() -> Vec<f32> {
+    let sample_rate = 44100;
+    let duration = 2.0; // 2 seconds
+    let mut samples = Vec::new();
+    
+    // Create a celebratory chord progression
+    let frequencies = [
+        [523.25, 659.25, 783.99], // C major chord
+        [587.33, 739.99, 880.0],  // D major chord
+        [659.25, 830.61, 987.77], // E major chord
+        [698.46, 880.0, 1046.5],  // F major chord
+    ];
+    
+    for chord_idx in 0..frequencies.len() {
+        let chord_duration = duration / frequencies.len() as f32;
+        let chord_samples = (sample_rate as f32 * chord_duration) as usize;
+        
+        for i in 0..chord_samples {
+            let t = i as f32 / sample_rate as f32;
+            let mut sample = 0.0;
+            
+            // Add each note in the chord
+            for &freq in &frequencies[chord_idx] {
+                sample += (t * freq * 2.0 * PI).sin() * 0.2;
+            }
+            
+            // Add some envelope
+            let envelope = if t < 0.1 {
+                t / 0.1
+            } else if t > chord_duration - 0.1 {
+                (chord_duration - t) / 0.1
+            } else {
+                1.0
+            };
+            
+            samples.push(sample * envelope);
+        }
+    }
+    
+    samples
+}
