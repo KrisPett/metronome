@@ -152,44 +152,189 @@ pub fn create_beep_sound() -> Vec<f32> {
     wave
 }
 
-pub fn create_celebration_sound() -> Vec<f32> {
-    let sample_rate = 44100;
-    let duration = 2.0; // 2 seconds
-    let mut samples = Vec::new();
+// pub fn create_celebration_sound() -> Vec<f32> {
+//     let sample_rate = 44100;
+//     let duration = 2.0; // 2 seconds
+//     let mut samples = Vec::new();
     
-    // Create a celebratory chord progression
-    let frequencies = [
-        [523.25, 659.25, 783.99], // C major chord
-        [587.33, 739.99, 880.0],  // D major chord
-        [659.25, 830.61, 987.77], // E major chord
-        [698.46, 880.0, 1046.5],  // F major chord
+//     // Create a celebratory chord progression
+//     let frequencies = [
+//         [523.25, 659.25, 783.99], // C major chord
+//         [587.33, 739.99, 880.0],  // D major chord
+//         [659.25, 830.61, 987.77], // E major chord
+//         [698.46, 880.0, 1046.5],  // F major chord
+//     ];
+    
+//     for chord_idx in 0..frequencies.len() {
+//         let chord_duration = duration / frequencies.len() as f32;
+//         let chord_samples = (sample_rate as f32 * chord_duration) as usize;
+        
+//         for i in 0..chord_samples {
+//             let t = i as f32 / sample_rate as f32;
+//             let mut sample = 0.0;
+            
+//             // Add each note in the chord
+//             for &freq in &frequencies[chord_idx] {
+//                 sample += (t * freq * 2.0 * PI).sin() * 0.2;
+//             }
+            
+//             // Add some envelope
+//             let envelope = if t < 0.1 {
+//                 t / 0.1
+//             } else if t > chord_duration - 0.1 {
+//                 (chord_duration - t) / 0.1
+//             } else {
+//                 1.0
+//             };
+            
+//             samples.push(sample * envelope);
+//         }
+//     }
+    
+//     samples
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pub fn create_celebration_sound() -> Vec<f32> {
+    const SAMPLE_RATE: f32 = 44100.0;
+    const DURATION: f32 = 1.5;
+    const CHORD_COUNT: usize = 4;
+    
+    // Shorter, punchy chord progression
+    let chord_progression = [
+        [261.63, 329.63, 392.0, 493.88],   // C major 7
+        [349.23, 440.0, 523.25, 659.25],   // F major 7
+        [392.0, 493.88, 587.33, 739.99],   // G major 7
+        [523.25, 659.25, 783.99, 987.77],  // C major (octave higher)
     ];
     
-    for chord_idx in 0..frequencies.len() {
-        let chord_duration = duration / frequencies.len() as f32;
-        let chord_samples = (sample_rate as f32 * chord_duration) as usize;
+    let total_samples = (SAMPLE_RATE * DURATION) as usize;
+    let mut samples = vec![0.0; total_samples];
+    
+    // Generate each chord with overlapping for smoother transitions
+    for (chord_idx, chord) in chord_progression.iter().enumerate() {
+        let chord_start = (chord_idx as f32 * DURATION / CHORD_COUNT as f32 * SAMPLE_RATE) as usize;
+        let chord_duration = DURATION / CHORD_COUNT as f32 * 1.2; // 20% overlap
+        let chord_samples = (SAMPLE_RATE * chord_duration) as usize;
         
         for i in 0..chord_samples {
-            let t = i as f32 / sample_rate as f32;
-            let mut sample = 0.0;
-            
-            // Add each note in the chord
-            for &freq in &frequencies[chord_idx] {
-                sample += (t * freq * 2.0 * PI).sin() * 0.2;
+            let sample_idx = chord_start + i;
+            if sample_idx >= total_samples {
+                break;
             }
             
-            // Add some envelope
-            let envelope = if t < 0.1 {
-                t / 0.1
-            } else if t > chord_duration - 0.1 {
-                (chord_duration - t) / 0.1
-            } else {
-                1.0
-            };
+            let t = i as f32 / SAMPLE_RATE;
+            let mut chord_sample = 0.0;
             
-            samples.push(sample * envelope);
+            // Generate each note in the chord with harmonic richness
+            for (note_idx, &frequency) in chord.iter().enumerate() {
+                let amplitude = 0.15 / chord.len() as f32; // Normalize by chord size
+                
+                // Add fundamental frequency
+                chord_sample += (t * frequency * 2.0 * PI).sin() * amplitude;
+                
+                // Add subtle harmonics for richness
+                chord_sample += (t * frequency * 4.0 * PI).sin() * amplitude * 0.1;
+                chord_sample += (t * frequency * 6.0 * PI).sin() * amplitude * 0.05;
+                
+                // Add slight detuning for natural sound
+                let detune = 1.0 + (note_idx as f32 * 0.002);
+                chord_sample += (t * frequency * detune * 2.0 * PI).sin() * amplitude * 0.3;
+            }
+            
+            // Enhanced envelope with attack, sustain, and release
+            let envelope = calculate_envelope(t, chord_duration);
+            
+            // Add some sparkle with high-frequency content
+            let sparkle = (t * 2000.0 * 2.0 * PI).sin() * 0.02 * envelope * (t * 10.0).sin().abs();
+            
+            // Blend with existing audio (for overlapping chords)
+            let final_sample = (chord_sample + sparkle) * envelope;
+            samples[sample_idx] += final_sample;
         }
     }
     
+    // Add celebratory "bell" hits at the end
+    add_bell_flourish(&mut samples, SAMPLE_RATE, DURATION);
+    
+    // Apply gentle compression to prevent clipping
+    apply_soft_limiter(&mut samples);
+    
     samples
+}
+
+fn calculate_envelope(t: f32, duration: f32) -> f32 {
+    const ATTACK_TIME: f32 = 0.05;
+    const RELEASE_TIME: f32 = 0.3;
+    
+    if t < ATTACK_TIME {
+        // Smooth attack
+        let progress = t / ATTACK_TIME;
+        progress * progress // Quadratic curve for smooth start
+    } else if t > duration - RELEASE_TIME {
+        // Exponential decay for natural release
+        let release_progress = (duration - t) / RELEASE_TIME;
+        release_progress * release_progress
+    } else {
+        // Sustain with slight vibrato
+        1.0 + (t * 6.0 * PI).sin() * 0.05
+    }
+}
+
+fn add_bell_flourish(samples: &mut [f32], sample_rate: f32, duration: f32) {
+    let bell_frequencies = [1046.5, 1318.5, 1567.98, 2093.0]; // High C, E, G, C
+    let bell_start = (duration * 0.75 * sample_rate) as usize;
+    let bell_duration = 0.25;
+    let bell_samples = (sample_rate * bell_duration) as usize;
+    
+    for (i, &freq) in bell_frequencies.iter().enumerate() {
+        let delay = i * (sample_rate * 0.05) as usize; // Stagger the bells
+        
+        for j in 0..bell_samples {
+            let sample_idx = bell_start + delay + j;
+            if sample_idx >= samples.len() {
+                break;
+            }
+            
+            let t = j as f32 / sample_rate;
+            let bell_envelope = (-t * 8.0).exp(); // Sharp attack, exponential decay
+            let bell_sample = (t * freq * 2.0 * PI).sin() * 0.1 * bell_envelope;
+            
+            samples[sample_idx] += bell_sample;
+        }
+    }
+}
+
+fn apply_soft_limiter(samples: &mut [f32]) {
+    const THRESHOLD: f32 = 0.8;
+    
+    for sample in samples.iter_mut() {
+        if sample.abs() > THRESHOLD {
+            *sample = sample.signum() * (THRESHOLD + (sample.abs() - THRESHOLD) * 0.2);
+        }
+    }
 }
