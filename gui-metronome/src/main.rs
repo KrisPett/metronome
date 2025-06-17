@@ -206,7 +206,7 @@ fn metronome_loop(
                 state.remaining_ticks.store(remaining, Ordering::Relaxed);
 
                 if remaining == 0 {
-                    let new_bpm = rng.gen_range(60..=200);
+                    let new_bpm = rng.gen_range(60..=150); // min/max random value
                     state.bpm.store(new_bpm, Ordering::Relaxed);
                     state.remaining_ticks.store(
                         state.random_count.load(Ordering::Relaxed),
