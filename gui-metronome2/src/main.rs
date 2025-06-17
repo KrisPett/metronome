@@ -5,18 +5,20 @@ use rodio::{OutputStream, OutputStreamHandle, Sink, buffer::SamplesBuffer};
 use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
 };
 use std::thread;
 use std::time::{Duration, Instant};
+
 mod utilities;
 use crate::utilities::sound::{
     create_beep_sound, create_click_sound, create_cowbell_sound, create_hihat_sound,
     create_kick_sound, create_square_sound, create_triangle_sound, create_wood_block_sound,
 };
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum MetronomeMode {
     Standard,
     Random,
@@ -26,62 +28,154 @@ enum MetronomeMode {
     Subdivision,
 }
 
+// Commands sent to the metronome thread
+#[derive(Debug, Clone)]
+enum MetronomeCommand {
+    Start,
+    Stop,
+    ChangeBpm(u32),
+    ChangeVolume(u32),
+    ChangeSoundType(u32),
+    ChangeMode(MetronomeMode),
+    UpdateRandomSettings { count: u32 },
+    UpdatePracticeSettings { sections: Vec<(u32, u32)> },
+    UpdatePolyrhythmSettings { primary: u32, secondary: u32, accent_primary: bool, accent_secondary: bool },
+    UpdateRitardandoSettings { start_bpm: u32, target_bpm: u32, duration: u32 },
+    UpdateSubdivisionSettings { subdivisions: u32, pattern: Vec<bool> },
+    Reset,
+}
+
+// Events sent back from the metronome thread
+#[derive(Debug, Clone)]
+enum MetronomeEvent {
+    Beat { tick_count: u32, is_accent: bool },
+    ModeChanged { mode: MetronomeMode },
+    BpmChanged { bpm: u32 },
+    Error { message: String },
+}
+
 struct MetronomeApp {
-    state: Arc<MetronomeState>,
+    // Communication with metronome thread
+    command_sender: Sender<MetronomeCommand>,
+    event_receiver: Receiver<MetronomeEvent>,
+    
+    // Shared state (read-only from UI thread)
+    shared_state: Arc<SharedMetronomeState>,
+    
+    // UI-only state
     animation_progress: f32,
     beat_progress: f32,
+    last_beat_time: Instant,
+    
+    // Audio resources
     _stream: OutputStream,
     #[allow(dead_code)]
     stream_handle: OutputStreamHandle,
-    #[allow(dead_code)]
-    sound_cache: HashMap<u32, Vec<f32>>,
-    #[allow(dead_code)]
-    sink: Arc<Mutex<Sink>>,
 }
 
-struct MetronomeState {
+// Thread-safe shared state
+struct SharedMetronomeState {
+    // Core state
     bpm: AtomicU32,
     is_running: AtomicBool,
     volume: AtomicU32,
     sound_type: AtomicU32,
     tick_count: AtomicU32,
     
-    // Mode selection
-    mode: Arc<Mutex<MetronomeMode>>,
+    // Current mode (atomic for simple reads)
+    mode: AtomicUsize, // We'll cast MetronomeMode to/from usize
     
-    // Random mode
-    random_count: AtomicU32,
-    remaining_ticks: AtomicU32,
+    // Mode-specific state (protected by RwLock for complex data)
+    random_state: RwLock<RandomState>,
+    practice_state: RwLock<PracticeState>,
+    polyrhythm_state: RwLock<PolyrhythmState>,
+    ritardando_state: RwLock<RitardandoState>,
+    subdivision_state: RwLock<SubdivisionState>,
     
-    // Practice mode
-    practice_sections: Arc<Mutex<Vec<(u32, u32)>>>, // (BPM, beats)
-    current_section: AtomicU32,
-    section_remaining: AtomicU32,
-    
-    // Polyrhythm mode
-    poly_primary: AtomicU32,   // Primary rhythm (e.g., 4)
-    poly_secondary: AtomicU32, // Secondary rhythm (e.g., 3)
-    poly_accent_primary: AtomicBool,
-    poly_accent_secondary: AtomicBool,
-    
-    // Accelerando/Ritardando mode
-    start_bpm: AtomicU32,
-    target_bpm: AtomicU32,
-    tempo_change_duration: AtomicU32, // in beats
-    tempo_change_remaining: AtomicU32,
-    
-    // Subdivision mode
-    subdivisions: AtomicU32, // 1=quarter, 2=eighth, 3=triplet, 4=sixteenth
-    accent_pattern: Arc<Mutex<Vec<bool>>>,
-    
-    last_beat: Arc<Mutex<Instant>>,
+    // Beat timing
+    last_beat: RwLock<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct RandomState {
+    count: u32,
+    remaining_ticks: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PracticeState {
+    sections: Vec<(u32, u32)>, // (BPM, beats)
+    current_section: u32,
+    section_remaining: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PolyrhythmState {
+    primary: u32,
+    secondary: u32,
+    accent_primary: bool,
+    accent_secondary: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RitardandoState {
+    start_bpm: u32,
+    target_bpm: u32,
+    duration: u32,
+    remaining: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SubdivisionState {
+    subdivisions: u32,
+    accent_pattern: Vec<bool>,
 }
 
 impl Default for MetronomeApp {
     fn default() -> Self {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-        let sink = Arc::new(Mutex::new(Sink::try_new(&stream_handle).unwrap()));
+        
+        // Create communication channels
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        
+        // Initialize shared state
+        let shared_state = Arc::new(SharedMetronomeState {
+            bpm: AtomicU32::new(120),
+            is_running: AtomicBool::new(false),
+            volume: AtomicU32::new(80),
+            sound_type: AtomicU32::new(0),
+            tick_count: AtomicU32::new(0),
+            mode: AtomicUsize::new(MetronomeMode::Standard as usize),
+            random_state: RwLock::new(RandomState {
+                count: 100,
+                remaining_ticks: 100,
+            }),
+            practice_state: RwLock::new(PracticeState {
+                sections: vec![(60, 32), (120, 32), (180, 32)],
+                current_section: 0,
+                section_remaining: 0,
+            }),
+            polyrhythm_state: RwLock::new(PolyrhythmState {
+                primary: 4,
+                secondary: 3,
+                accent_primary: true,
+                accent_secondary: true,
+            }),
+            ritardando_state: RwLock::new(RitardandoState {
+                start_bpm: 120,
+                target_bpm: 180,
+                duration: 64,
+                remaining: 0,
+            }),
+            subdivision_state: RwLock::new(SubdivisionState {
+                subdivisions: 1,
+                accent_pattern: vec![true, false, false, false],
+            }),
+            last_beat: RwLock::new(Instant::now()),
+        });
 
+        // Create sound cache
         let mut sound_cache = HashMap::new();
         for i in 0..8 {
             let sound_data = match i {
@@ -98,55 +192,43 @@ impl Default for MetronomeApp {
             sound_cache.insert(i, sound_data);
         }
 
-        let state = Arc::new(MetronomeState {
-            bpm: AtomicU32::new(120),
-            is_running: AtomicBool::new(false),
-            volume: AtomicU32::new(80),
-            sound_type: AtomicU32::new(0),
-            tick_count: AtomicU32::new(0),
-            
-            mode: Arc::new(Mutex::new(MetronomeMode::Standard)),
-            
-            random_count: AtomicU32::new(100),
-            remaining_ticks: AtomicU32::new(0),
-            
-            practice_sections: Arc::new(Mutex::new(vec![(60, 32), (120, 32), (180, 32)])),
-            current_section: AtomicU32::new(0),
-            section_remaining: AtomicU32::new(0),
-            
-            poly_primary: AtomicU32::new(4),
-            poly_secondary: AtomicU32::new(3),
-            poly_accent_primary: AtomicBool::new(true),
-            poly_accent_secondary: AtomicBool::new(true),
-            
-            start_bpm: AtomicU32::new(120),
-            target_bpm: AtomicU32::new(180),
-            tempo_change_duration: AtomicU32::new(64),
-            tempo_change_remaining: AtomicU32::new(0),
-            
-            subdivisions: AtomicU32::new(1),
-            accent_pattern: Arc::new(Mutex::new(vec![true, false, false, false])),
-            
-            last_beat: Arc::new(Mutex::new(Instant::now())),
-        });
-
-        let state_clone = Arc::clone(&state);
-        let sink_clone = Arc::clone(&sink);
-        let sound_cache_clone = sound_cache.clone();
-
+        // Start metronome thread
+        let shared_state_clone = Arc::clone(&shared_state);
+        let sink = Arc::new(Mutex::new(Sink::try_new(&stream_handle).unwrap()));
+        
         thread::spawn(move || {
-            metronome_thread(state_clone, sink_clone, sound_cache_clone);
+            metronome_thread(shared_state_clone, sink, sound_cache, command_receiver, event_sender);
         });
 
         Self {
-            state,
+            command_sender,
+            event_receiver,
+            shared_state,
             animation_progress: 0.0,
             beat_progress: 0.0,
+            last_beat_time: Instant::now(),
             _stream,
             stream_handle,
-            sound_cache,
-            sink,
         }
+    }
+}
+
+impl SharedMetronomeState {
+    fn get_mode(&self) -> MetronomeMode {
+        let mode_val = self.mode.load(Ordering::Relaxed);
+        match mode_val {
+            0 => MetronomeMode::Standard,
+            1 => MetronomeMode::Random,
+            2 => MetronomeMode::Practice,
+            3 => MetronomeMode::Polyrhythm,
+            4 => MetronomeMode::Ritardando,
+            5 => MetronomeMode::Subdivision,
+            _ => MetronomeMode::Standard,
+        }
+    }
+    
+    fn set_mode(&self, mode: MetronomeMode) {
+        self.mode.store(mode as usize, Ordering::Relaxed);
     }
 }
 
@@ -183,16 +265,103 @@ impl Theme {
 }
 
 fn metronome_thread(
-    state: Arc<MetronomeState>,
+    state: Arc<SharedMetronomeState>,
     sink: Arc<Mutex<Sink>>,
     sound_cache: HashMap<u32, Vec<f32>>,
+    command_receiver: Receiver<MetronomeCommand>,
+    event_sender: Sender<MetronomeEvent>,
 ) {
     let mut last_tick = Instant::now();
     let mut subdivision_tick = 0u32;
+    
+    // Local state for the metronome thread
+    let mut local_random_state = state.random_state.read().unwrap().clone();
+    let mut local_practice_state = state.practice_state.read().unwrap().clone();
+    let mut local_polyrhythm_state = state.polyrhythm_state.read().unwrap().clone();
+    let mut local_ritardando_state = state.ritardando_state.read().unwrap().clone();
+    let mut local_subdivision_state = state.subdivision_state.read().unwrap().clone();
 
     loop {
+        // Process commands (non-blocking)
+        while let Ok(command) = command_receiver.try_recv() {
+            match command {
+                MetronomeCommand::Start => {
+                    state.is_running.store(true, Ordering::Relaxed);
+                    state.tick_count.store(0, Ordering::Relaxed);
+                    last_tick = Instant::now();
+                    subdivision_tick = 0;
+                    
+                    // Reset mode-specific state
+                    let current_mode = state.get_mode();
+                    match current_mode {
+                        MetronomeMode::Random => {
+                            local_random_state.remaining_ticks = local_random_state.count;
+                        },
+                        MetronomeMode::Practice => {
+                            local_practice_state.current_section = 0;
+                            local_practice_state.section_remaining = 0;
+                        },
+                        MetronomeMode::Ritardando => {
+                            local_ritardando_state.remaining = local_ritardando_state.duration;
+                            state.bpm.store(local_ritardando_state.start_bpm, Ordering::Relaxed);
+                        },
+                        _ => {},
+                    }
+                },
+                MetronomeCommand::Stop => {
+                    state.is_running.store(false, Ordering::Relaxed);
+                },
+                MetronomeCommand::ChangeBpm(bpm) => {
+                    state.bpm.store(bpm, Ordering::Relaxed);
+                },
+                MetronomeCommand::ChangeVolume(volume) => {
+                    state.volume.store(volume, Ordering::Relaxed);
+                },
+                MetronomeCommand::ChangeSoundType(sound_type) => {
+                    state.sound_type.store(sound_type, Ordering::Relaxed);
+                },
+                MetronomeCommand::ChangeMode(mode) => {
+                    state.set_mode(mode);
+                    let _ = event_sender.send(MetronomeEvent::ModeChanged { mode });
+                },
+                MetronomeCommand::UpdateRandomSettings { count } => {
+                    local_random_state.count = count;
+                    local_random_state.remaining_ticks = count;
+                    *state.random_state.write().unwrap() = local_random_state.clone();
+                },
+                MetronomeCommand::UpdatePracticeSettings { sections } => {
+                    local_practice_state.sections = sections;
+                    *state.practice_state.write().unwrap() = local_practice_state.clone();
+                },
+                MetronomeCommand::UpdatePolyrhythmSettings { primary, secondary, accent_primary, accent_secondary } => {
+                    local_polyrhythm_state = PolyrhythmState {
+                        primary,
+                        secondary,
+                        accent_primary,
+                        accent_secondary,
+                    };
+                    *state.polyrhythm_state.write().unwrap() = local_polyrhythm_state.clone();
+                },
+                MetronomeCommand::UpdateRitardandoSettings { start_bpm, target_bpm, duration } => {
+                    local_ritardando_state.start_bpm = start_bpm;
+                    local_ritardando_state.target_bpm = target_bpm;
+                    local_ritardando_state.duration = duration.max(1); // Prevent division by zero
+                    *state.ritardando_state.write().unwrap() = local_ritardando_state.clone();
+                },
+                MetronomeCommand::UpdateSubdivisionSettings { subdivisions, pattern } => {
+                    local_subdivision_state.subdivisions = subdivisions;
+                    local_subdivision_state.accent_pattern = pattern;
+                    *state.subdivision_state.write().unwrap() = local_subdivision_state.clone();
+                },
+                MetronomeCommand::Reset => {
+                    state.tick_count.store(0, Ordering::Relaxed);
+                    subdivision_tick = 0;
+                },
+            }
+        }
+
         if state.is_running.load(Ordering::Relaxed) {
-            let current_mode = *state.mode.lock().unwrap();
+            let current_mode = state.get_mode();
             let mut effective_bpm = state.bpm.load(Ordering::Relaxed);
             let mut should_tick = false;
             let mut is_accent = false;
@@ -201,8 +370,7 @@ fn metronome_thread(
             // Calculate beat interval based on mode
             let beat_interval = match current_mode {
                 MetronomeMode::Subdivision => {
-                    let subdivisions = state.subdivisions.load(Ordering::Relaxed);
-                    let multiplier = match subdivisions {
+                    let multiplier = match local_subdivision_state.subdivisions {
                         1 => 1.0,  // Quarter notes
                         2 => 2.0,  // Eighth notes
                         3 => 3.0,  // Triplets
@@ -211,7 +379,7 @@ fn metronome_thread(
                     };
                     Duration::from_millis((60000.0 / (effective_bpm as f32 * multiplier)) as u64)
                 },
-                _ => Duration::from_millis(60000 / effective_bpm as u64),
+                _ => Duration::from_millis(60000 / effective_bpm.max(1) as u64), // Prevent division by zero
             };
 
             if last_tick.elapsed() >= beat_interval {
@@ -223,108 +391,120 @@ fn metronome_thread(
                     },
                     
                     MetronomeMode::Random => {
-                        let mut remaining = state.remaining_ticks.load(Ordering::Relaxed);
-                        if remaining == 0 {
-                            remaining = state.random_count.load(Ordering::Relaxed);
-                            state.remaining_ticks.store(remaining, Ordering::Relaxed);
+                        if local_random_state.remaining_ticks == 0 {
+                            local_random_state.remaining_ticks = local_random_state.count;
                         }
                         
-                        remaining -= 1;
-                        state.remaining_ticks.store(remaining, Ordering::Relaxed);
+                        local_random_state.remaining_ticks = local_random_state.remaining_ticks.saturating_sub(1);
                         
-                        if remaining == 0 {
+                        if local_random_state.remaining_ticks == 0 {
                             let mut rng = rand::thread_rng();
                             let new_bpm = rng.gen_range(60..=200);
                             state.bpm.store(new_bpm, Ordering::Relaxed);
+                            let _ = event_sender.send(MetronomeEvent::BpmChanged { bpm: new_bpm });
+                        }
+                        
+                        // Update shared state
+                        if let Ok(mut shared_random) = state.random_state.try_write() {
+                            *shared_random = local_random_state.clone();
                         }
                     },
                     
                     MetronomeMode::Practice => {
-                        let mut section_remaining = state.section_remaining.load(Ordering::Relaxed);
-                        if section_remaining == 0 {
+                        if local_practice_state.section_remaining == 0 {
                             // Move to next section
-                            let sections = state.practice_sections.lock().unwrap();
-                            let current_section = state.current_section.load(Ordering::Relaxed) as usize;
+                            let current_section = local_practice_state.current_section as usize;
                             
-                            if current_section < sections.len() {
-                                let (section_bpm, section_beats) = sections[current_section];
+                            if current_section < local_practice_state.sections.len() {
+                                let (section_bpm, section_beats) = local_practice_state.sections[current_section];
                                 state.bpm.store(section_bpm, Ordering::Relaxed);
-                                state.section_remaining.store(section_beats, Ordering::Relaxed);
-                                section_remaining = section_beats;
+                                local_practice_state.section_remaining = section_beats;
                                 
                                 // Move to next section for next time
-                                let next_section = (current_section + 1) % sections.len();
-                                state.current_section.store(next_section as u32, Ordering::Relaxed);
+                                let next_section = (current_section + 1) % local_practice_state.sections.len();
+                                local_practice_state.current_section = next_section as u32;
+                                
+                                let _ = event_sender.send(MetronomeEvent::BpmChanged { bpm: section_bpm });
                             }
                         }
                         
-                        if section_remaining > 0 {
-                            state.section_remaining.store(section_remaining - 1, Ordering::Relaxed);
+                        local_practice_state.section_remaining = local_practice_state.section_remaining.saturating_sub(1);
+                        
+                        // Update shared state
+                        if let Ok(mut shared_practice) = state.practice_state.try_write() {
+                            *shared_practice = local_practice_state.clone();
                         }
                     },
                     
                     MetronomeMode::Polyrhythm => {
-                        let primary = state.poly_primary.load(Ordering::Relaxed);
-                        let secondary = state.poly_secondary.load(Ordering::Relaxed);
                         let tick_count = state.tick_count.load(Ordering::Relaxed);
                         
                         // Check if this tick aligns with primary rhythm
-                        let primary_hit = (tick_count % primary) == 0;
+                        let primary_hit = local_polyrhythm_state.primary > 0 && (tick_count % local_polyrhythm_state.primary) == 0;
                         // Check if this tick aligns with secondary rhythm  
-                        let secondary_hit = (tick_count % secondary) == 0;
+                        let secondary_hit = local_polyrhythm_state.secondary > 0 && (tick_count % local_polyrhythm_state.secondary) == 0;
                         
-                        if primary_hit && state.poly_accent_primary.load(Ordering::Relaxed) {
+                        if primary_hit && local_polyrhythm_state.accent_primary {
                             is_accent = true;
                         }
-                        if secondary_hit && state.poly_accent_secondary.load(Ordering::Relaxed) {
+                        if secondary_hit && local_polyrhythm_state.accent_secondary {
                             use_alternate_sound = true;
                         }
                     },
                     
                     MetronomeMode::Ritardando => {
-                        let mut remaining = state.tempo_change_remaining.load(Ordering::Relaxed);
-                        if remaining == 0 {
-                            remaining = state.tempo_change_duration.load(Ordering::Relaxed);
-                            state.tempo_change_remaining.store(remaining, Ordering::Relaxed);
+                        if local_ritardando_state.remaining == 0 {
+                            local_ritardando_state.remaining = local_ritardando_state.duration;
                         }
                         
-                        let start_bpm = state.start_bpm.load(Ordering::Relaxed) as f32;
-                        let target_bpm = state.target_bpm.load(Ordering::Relaxed) as f32;
-                        let duration = state.tempo_change_duration.load(Ordering::Relaxed) as f32;
+                        let start_bpm = local_ritardando_state.start_bpm as f32;
+                        let target_bpm = local_ritardando_state.target_bpm as f32;
+                        let duration = local_ritardando_state.duration as f32;
                         
-                        // Prevent division by zero - ensure duration is at least 1
+                        // Prevent division by zero
                         if duration > 0.0 {
-                            let progress = (duration - remaining as f32) / duration;
+                            let progress = (duration - local_ritardando_state.remaining as f32) / duration;
                             let current_bpm = start_bpm - (start_bpm - target_bpm) * progress;
-                            state.bpm.store(current_bpm as u32, Ordering::Relaxed);
+                            let current_bpm_u32 = (current_bpm as u32).max(1); // Ensure at least 1 BPM
+                            state.bpm.store(current_bpm_u32, Ordering::Relaxed);
                         } else {
                             // If duration is 0, just set to target BPM
-                            state.bpm.store(target_bpm as u32, Ordering::Relaxed);
+                            state.bpm.store(local_ritardando_state.target_bpm, Ordering::Relaxed);
                         }
                         
-                        if remaining > 0 {
-                            state.tempo_change_remaining.store(remaining - 1, Ordering::Relaxed);
+                        local_ritardando_state.remaining = local_ritardando_state.remaining.saturating_sub(1);
+                        
+                        // Update shared state
+                        if let Ok(mut shared_ritardando) = state.ritardando_state.try_write() {
+                            *shared_ritardando = local_ritardando_state.clone();
                         }
                     },
                     
                     MetronomeMode::Subdivision => {
-                        let subdivisions = state.subdivisions.load(Ordering::Relaxed);
-                        let accent_pattern = state.accent_pattern.lock().unwrap();
+                        if !local_subdivision_state.accent_pattern.is_empty() {
+                            let pattern_index = subdivision_tick as usize % local_subdivision_state.accent_pattern.len();
+                            is_accent = local_subdivision_state.accent_pattern[pattern_index];
+                        }
                         
-                        let pattern_index = subdivision_tick as usize % accent_pattern.len();
-                        is_accent = accent_pattern[pattern_index];
-                        
-                        subdivision_tick += 1;
+                        subdivision_tick = subdivision_tick.wrapping_add(1);
                     },
                 }
 
                 if should_tick {
-                    state.tick_count.fetch_add(1, Ordering::Relaxed);
+                    let new_tick_count = state.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-                    if let Ok(mut last_beat) = state.last_beat.lock() {
+                    // Update last beat time atomically
+                    if let Ok(mut last_beat) = state.last_beat.try_write() {
                         *last_beat = Instant::now();
                     }
 
+                    // Send beat event
+                    let _ = event_sender.send(MetronomeEvent::Beat {
+                        tick_count: new_tick_count,
+                        is_accent,
+                    });
+
+                    // Play sound
                     let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
                     let mut sound_type = state.sound_type.load(Ordering::Relaxed);
                     
@@ -333,7 +513,11 @@ fn metronome_thread(
                         sound_type = (sound_type + 1) % 8; // Use next sound in list
                     }
                     
-                    let final_volume = if is_accent { volume * 1.5 } else { volume };
+                    let final_volume = if is_accent { 
+                        (volume * 1.5).min(1.0) // Cap at 100%
+                    } else { 
+                        volume 
+                    };
 
                     if let Some(sound_data) = sound_cache.get(&sound_type) {
                         let volume_adjusted_sound: Vec<f32> =
@@ -341,7 +525,7 @@ fn metronome_thread(
 
                         let source = SamplesBuffer::new(1, 44100, volume_adjusted_sound);
 
-                        if let Ok(sink_guard) = sink.lock() {
+                        if let Ok(sink_guard) = sink.try_lock() {
                             sink_guard.append(source);
                         }
                     }
@@ -360,6 +544,25 @@ fn metronome_thread(
 
 impl eframe::App for MetronomeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process events from metronome thread
+        while let Ok(event) = self.event_receiver.try_recv() {
+            match event {
+                MetronomeEvent::Beat { is_accent, .. } => {
+                    self.last_beat_time = Instant::now();
+                    // Could add visual feedback for accents here
+                },
+                MetronomeEvent::ModeChanged { .. } => {
+                    // Handle mode change notifications
+                },
+                MetronomeEvent::BpmChanged { .. } => {
+                    // Handle BPM change notifications
+                },
+                MetronomeEvent::Error { message } => {
+                    eprintln!("Metronome error: {}", message);
+                },
+            }
+        }
+
         let theme = Theme::dark();
 
         let mut style = (*ctx.style()).clone();
@@ -378,26 +581,29 @@ impl eframe::App for MetronomeApp {
         style.spacing.indent = 25.0;
         ctx.set_style(style);
 
-        let bpm = self.state.bpm.load(Ordering::Relaxed);
-        let is_running = self.state.is_running.load(Ordering::Relaxed);
-        let volume = self.state.volume.load(Ordering::Relaxed);
-        let tick_count = self.state.tick_count.load(Ordering::Relaxed);
-        let current_mode = *self.state.mode.lock().unwrap();
+        let bpm = self.shared_state.bpm.load(Ordering::Relaxed);
+        let is_running = self.shared_state.is_running.load(Ordering::Relaxed);
+        let volume = self.shared_state.volume.load(Ordering::Relaxed);
+        let tick_count = self.shared_state.tick_count.load(Ordering::Relaxed);
+        let current_mode = self.shared_state.get_mode();
 
         if is_running {
-            if let Ok(last_beat) = self.state.last_beat.lock() {
+            if let Ok(last_beat) = self.shared_state.last_beat.try_read() {
                 let time_since_beat = last_beat.elapsed().as_millis() as f32;
                 let effective_bpm = match current_mode {
                     MetronomeMode::Subdivision => {
-                        let subdivisions = self.state.subdivisions.load(Ordering::Relaxed);
-                        let multiplier = match subdivisions {
-                            1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
-                        };
-                        bpm as f32 * multiplier
+                        if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                            let multiplier = match subdivision_state.subdivisions {
+                                1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
+                            };
+                            bpm as f32 * multiplier
+                        } else {
+                            bpm as f32
+                        }
                     },
                     _ => bpm as f32,
                 };
-                let beat_interval_ms = 60000.0 / effective_bpm;
+                let beat_interval_ms = 60000.0 / effective_bpm.max(1.0); // Prevent division by zero
 
                 self.beat_progress = (time_since_beat / beat_interval_ms).min(1.0);
 
@@ -487,28 +693,7 @@ impl eframe::App for MetronomeApp {
                                 )
                                 .clicked()
                             {
-                                *self.state.mode.lock().unwrap() = *mode;
-                                
-                                // Reset mode-specific counters
-                                match mode {
-                                    MetronomeMode::Random => {
-                                        self.state.remaining_ticks.store(
-                                            self.state.random_count.load(Ordering::Relaxed),
-                                            Ordering::Relaxed,
-                                        );
-                                    },
-                                    MetronomeMode::Practice => {
-                                        self.state.current_section.store(0, Ordering::Relaxed);
-                                        self.state.section_remaining.store(0, Ordering::Relaxed);
-                                    },
-                                    MetronomeMode::Ritardando => {
-                                        self.state.tempo_change_remaining.store(
-                                            self.state.tempo_change_duration.load(Ordering::Relaxed),
-                                            Ordering::Relaxed,
-                                        );
-                                    },
-                                    _ => {},
-                                }
+                                let _ = self.command_sender.send(MetronomeCommand::ChangeMode(*mode));
                             }
                         }
                     });
@@ -528,7 +713,7 @@ impl eframe::App for MetronomeApp {
 
             ui.add_space(20.0);
 
-            // Main metronome display (existing code)
+            // Main metronome display
             ui.vertical_centered(|ui| {
                 let base_size = 120.0;
                 let max_size = base_size + 40.0;
@@ -621,7 +806,7 @@ impl eframe::App for MetronomeApp {
 
             ui.add_space(20.0);
 
-            // Beat progress bar (existing code)
+            // Beat progress bar
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new("Beat Progress")
@@ -675,19 +860,21 @@ impl eframe::App for MetronomeApp {
 
                 // Subdivision marks for subdivision mode
                 if current_mode == MetronomeMode::Subdivision {
-                    let subdivisions = self.state.subdivisions.load(Ordering::Relaxed);
-                    for i in 1..subdivisions {
-                        let tick_x = track_rect.min.x + (slider_width * i as f32) / subdivisions as f32;
-                        let tick_top = track_rect.min.y - 3.0;
-                        let tick_bottom = track_rect.max.y + 3.0;
+                    if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                        let subdivisions = subdivision_state.subdivisions;
+                        for i in 1..subdivisions {
+                            let tick_x = track_rect.min.x + (slider_width * i as f32) / subdivisions as f32;
+                            let tick_top = track_rect.min.y - 3.0;
+                            let tick_bottom = track_rect.max.y + 3.0;
 
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(tick_x, tick_top),
-                                egui::pos2(tick_x, tick_bottom),
-                            ],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
-                        );
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(tick_x, tick_top),
+                                    egui::pos2(tick_x, tick_bottom),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                            );
+                        }
                     }
                 } else {
                     let num_subdivisions = 4;
@@ -710,15 +897,18 @@ impl eframe::App for MetronomeApp {
                 if is_running {
                     let effective_bpm = match current_mode {
                         MetronomeMode::Subdivision => {
-                            let subdivisions = self.state.subdivisions.load(Ordering::Relaxed);
-                            let multiplier = match subdivisions {
-                                1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
-                            };
-                            bpm as f32 * multiplier
+                            if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                                let multiplier = match subdivision_state.subdivisions {
+                                    1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
+                                };
+                                bpm as f32 * multiplier
+                            } else {
+                                bpm as f32
+                            }
                         },
                         _ => bpm as f32,
                     };
-                    let time_to_next_beat = (60000.0 / effective_bpm) * (1.0 - self.beat_progress);
+                    let time_to_next_beat = (60000.0 / effective_bpm.max(1.0)) * (1.0 - self.beat_progress);
                     ui.add_space(15.0);
                     ui.label(
                         egui::RichText::new(format!("Next beat in: {:.1}ms", time_to_next_beat))
@@ -748,7 +938,7 @@ impl eframe::App for MetronomeApp {
                             .show_value(false)
                             .handle_shape(egui::style::HandleShape::Circle);
                         if ui.add_sized([250.0, 25.0], slider).changed() {
-                            self.state.bpm.store(bpm_value as u32, Ordering::Relaxed);
+                            let _ = self.command_sender.send(MetronomeCommand::ChangeBpm(bpm_value as u32));
                         }
                         ui.add_space(10.0);
                         ui.label(
@@ -773,9 +963,7 @@ impl eframe::App for MetronomeApp {
                             .show_value(false)
                             .handle_shape(egui::style::HandleShape::Circle);
                         if ui.add_sized([250.0, 25.0], slider).changed() {
-                            self.state
-                                .volume
-                                .store(volume_value as u32, Ordering::Relaxed);
+                            let _ = self.command_sender.send(MetronomeCommand::ChangeVolume(volume_value as u32));
                         }
                         ui.add_space(10.0);
                         ui.label(
@@ -811,31 +999,10 @@ impl eframe::App for MetronomeApp {
                     )
                     .clicked()
                 {
-                    let new_state = !is_running;
-                    self.state.is_running.store(new_state, Ordering::Relaxed);
-                    if new_state {
-                        self.state.tick_count.store(0, Ordering::Relaxed);
-                        
-                        // Reset mode-specific counters
-                        match current_mode {
-                            MetronomeMode::Random => {
-                                self.state.remaining_ticks.store(
-                                    self.state.random_count.load(Ordering::Relaxed),
-                                    Ordering::Relaxed,
-                                );
-                            },
-                            MetronomeMode::Practice => {
-                                self.state.current_section.store(0, Ordering::Relaxed);
-                                self.state.section_remaining.store(0, Ordering::Relaxed);
-                            },
-                            MetronomeMode::Ritardando => {
-                                self.state.tempo_change_remaining.store(
-                                    self.state.tempo_change_duration.load(Ordering::Relaxed),
-                                    Ordering::Relaxed,
-                                );
-                            },
-                            _ => {},
-                        }
+                    if is_running {
+                        let _ = self.command_sender.send(MetronomeCommand::Stop);
+                    } else {
+                        let _ = self.command_sender.send(MetronomeCommand::Start);
                     }
                 }
             });
@@ -865,7 +1032,7 @@ impl eframe::App for MetronomeApp {
                         ("🔺", "Triangle"),
                         ("⬜", "Square"),
                     ];
-                    let current_sound = self.state.sound_type.load(Ordering::Relaxed) as usize;
+                    let current_sound = self.shared_state.sound_type.load(Ordering::Relaxed) as usize;
 
                     ui.horizontal_wrapped(|ui| {
                         for (i, (icon, name)) in sounds.iter().enumerate() {
@@ -894,7 +1061,7 @@ impl eframe::App for MetronomeApp {
                                 )
                                 .clicked()
                             {
-                                self.state.sound_type.store(i as u32, Ordering::Relaxed);
+                                let _ = self.command_sender.send(MetronomeCommand::ChangeSoundType(i as u32));
                             }
                         }
                     });
@@ -903,39 +1070,7 @@ impl eframe::App for MetronomeApp {
             ui.add_space(20.0);
 
             // Status display
-            let mode_info = match current_mode {
-                MetronomeMode::Random => {
-                    let remaining = self.state.remaining_ticks.load(Ordering::Relaxed);
-                    format!("Random Mode - Next change in {} beats", remaining)
-                },
-                MetronomeMode::Practice => {
-                    let current_section = self.state.current_section.load(Ordering::Relaxed);
-                    let section_remaining = self.state.section_remaining.load(Ordering::Relaxed);
-                    format!("Practice Mode - Section {} - {} beats remaining", current_section + 1, section_remaining)
-                },
-                MetronomeMode::Polyrhythm => {
-                    let primary = self.state.poly_primary.load(Ordering::Relaxed);
-                    let secondary = self.state.poly_secondary.load(Ordering::Relaxed);
-                    format!("Polyrhythm Mode - {}:{}", primary, secondary)
-                },
-                MetronomeMode::Ritardando => {
-                    let remaining = self.state.tempo_change_remaining.load(Ordering::Relaxed);
-                    let target = self.state.target_bpm.load(Ordering::Relaxed);
-                    format!("Ritardando - {} beats to {}BPM", remaining, target)
-                },
-                MetronomeMode::Subdivision => {
-                    let subdivisions = self.state.subdivisions.load(Ordering::Relaxed);
-                    let sub_name = match subdivisions {
-                        1 => "Quarter notes",
-                        2 => "Eighth notes", 
-                        3 => "Triplets",
-                        4 => "Sixteenth notes",
-                        _ => "Custom",
-                    };
-                    format!("Subdivision Mode - {}", sub_name)
-                },
-                MetronomeMode::Standard => "Standard Mode".to_string(),
-            };
+            let mode_info = self.get_mode_info(current_mode);
 
             egui::Frame::none()
                 .fill(theme.surface)
@@ -971,105 +1106,153 @@ impl eframe::App for MetronomeApp {
 }
 
 impl MetronomeApp {
-    fn draw_random_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let random_count = self.state.random_count.load(Ordering::Relaxed);
-        let remaining_ticks = self.state.remaining_ticks.load(Ordering::Relaxed);
-        let is_running = self.state.is_running.load(Ordering::Relaxed);
-        
-        egui::Frame::none()
-            .fill(theme.warning.gamma_multiply(0.2))
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(15.0))
-            .stroke(egui::Stroke::new(2.0, theme.warning))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("🎲 Random Mode Settings")
-                        .size(16.0)
-                        .color(theme.warning)
-                        .strong(),
-                );
-                ui.add_space(10.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Change every:");
-                    let mut random_count_value = random_count as f32;
-                    let slider = egui::Slider::new(&mut random_count_value, 10.0..=500.0)
-                        .suffix(" beats");
-                    if ui.add_sized([200.0, 20.0], slider).changed() {
-                        let new_count = random_count_value as u32;
-                        self.state.random_count.store(new_count, Ordering::Relaxed);
-                        
-                        // If currently running and remaining ticks is greater than new count,
-                        // reset remaining ticks to new count to avoid issues
-                        if is_running && remaining_ticks > new_count {
-                            self.state.remaining_ticks.store(new_count, Ordering::Relaxed);
-                        }
-                    }
-                });
-                
-                if is_running {
-                    ui.add_space(10.0);
-                    let progress = if random_count > 0 {
-                        (random_count - remaining_ticks) as f32 / random_count as f32
-                    } else {
-                        0.0
+    fn get_mode_info(&self, current_mode: MetronomeMode) -> String {
+        match current_mode {
+            MetronomeMode::Random => {
+                if let Ok(random_state) = self.shared_state.random_state.try_read() {
+                    format!("Random Mode - Next change in {} beats", random_state.remaining_ticks)
+                } else {
+                    "Random Mode".to_string()
+                }
+            },
+            MetronomeMode::Practice => {
+                if let Ok(practice_state) = self.shared_state.practice_state.try_read() {
+                    format!("Practice Mode - Section {} - {} beats remaining", 
+                           practice_state.current_section + 1, 
+                           practice_state.section_remaining)
+                } else {
+                    "Practice Mode".to_string()
+                }
+            },
+            MetronomeMode::Polyrhythm => {
+                if let Ok(poly_state) = self.shared_state.polyrhythm_state.try_read() {
+                    format!("Polyrhythm Mode - {}:{}", poly_state.primary, poly_state.secondary)
+                } else {
+                    "Polyrhythm Mode".to_string()
+                }
+            },
+            MetronomeMode::Ritardando => {
+                if let Ok(ritardando_state) = self.shared_state.ritardando_state.try_read() {
+                    format!("Ritardando - {} beats to {}BPM", 
+                           ritardando_state.remaining, 
+                           ritardando_state.target_bpm)
+                } else {
+                    "Ritardando Mode".to_string()
+                }
+            },
+            MetronomeMode::Subdivision => {
+                if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                    let sub_name = match subdivision_state.subdivisions {
+                        1 => "Quarter notes",
+                        2 => "Eighth notes", 
+                        3 => "Triplets",
+                        4 => "Sixteenth notes",
+                        _ => "Custom",
                     };
+                    format!("Subdivision Mode - {}", sub_name)
+                } else {
+                    "Subdivision Mode".to_string()
+                }
+            },
+            MetronomeMode::Standard => "Standard Mode".to_string(),
+        }
+    }
+
+    fn draw_random_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        if let Ok(random_state) = self.shared_state.random_state.try_read() {
+            let is_running = self.shared_state.is_running.load(Ordering::Relaxed);
+            
+            egui::Frame::none()
+                .fill(theme.warning.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.warning))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("🎲 Random Mode Settings")
+                            .size(16.0)
+                            .color(theme.warning)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
                     
                     ui.horizontal(|ui| {
-                        ui.label(format!("Next change in: {} beats", remaining_ticks));
-                        let progress_bar_width = 150.0;
-                        let progress_rect = ui.allocate_space([progress_bar_width, 8.0].into()).1;
-                        
-                        ui.painter().rect_filled(
-                            progress_rect,
-                            egui::Rounding::same(4.0),
-                            egui::Color32::from_gray(40),
-                        );
-                        
-                        let fill_width = progress_rect.width() * progress;
-                        let fill_rect = egui::Rect::from_min_size(
-                            progress_rect.min,
-                            egui::Vec2::new(fill_width, progress_rect.height()),
-                        );
-                        
-                        ui.painter().rect_filled(
-                            fill_rect,
-                            egui::Rounding::same(4.0),
-                            theme.warning,
-                        );
+                        ui.label("Change every:");
+                        let mut random_count_value = random_state.count as f32;
+                        let slider = egui::Slider::new(&mut random_count_value, 10.0..=500.0)
+                            .suffix(" beats");
+                        if ui.add_sized([200.0, 20.0], slider).changed() {
+                            let _ = self.command_sender.send(MetronomeCommand::UpdateRandomSettings {
+                                count: random_count_value as u32,
+                            });
+                        }
                     });
-                }
-                
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new("🎯 BPM will randomly change between 60-200")
-                        .size(12.0)
-                        .color(theme.warning),
-                );
-            });
+                    
+                    if is_running {
+                        ui.add_space(10.0);
+                        let progress = if random_state.count > 0 {
+                            (random_state.count - random_state.remaining_ticks) as f32 / random_state.count as f32
+                        } else {
+                            0.0
+                        };
+                        
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Next change in: {} beats", random_state.remaining_ticks));
+                            let progress_bar_width = 150.0;
+                            let progress_rect = ui.allocate_space([progress_bar_width, 8.0].into()).1;
+                            
+                            ui.painter().rect_filled(
+                                progress_rect,
+                                egui::Rounding::same(4.0),
+                                egui::Color32::from_gray(40),
+                            );
+                            
+                            let fill_width = progress_rect.width() * progress;
+                            let fill_rect = egui::Rect::from_min_size(
+                                progress_rect.min,
+                                egui::Vec2::new(fill_width, progress_rect.height()),
+                            );
+                            
+                            ui.painter().rect_filled(
+                                fill_rect,
+                                egui::Rounding::same(4.0),
+                                theme.warning,
+                            );
+                        });
+                    }
+                    
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new("🎯 BPM will randomly change between 60-200")
+                            .size(12.0)
+                            .color(theme.warning),
+                    );
+                });
+        }
     }
     
     fn draw_practice_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        egui::Frame::none()
-            .fill(theme.practice.gamma_multiply(0.2))
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(15.0))
-            .stroke(egui::Stroke::new(2.0, theme.practice))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("🎯 Practice Mode Settings")
-                        .size(16.0)
-                        .color(theme.practice)
-                        .strong(),
-                );
-                ui.add_space(10.0);
-                
-                ui.label("Practice sections (BPM, Beats):");
-                
-                if let Ok(mut sections) = self.state.practice_sections.try_lock() {
-                    let mut to_remove = None;
+        if let Ok(mut practice_state) = self.shared_state.practice_state.try_write() {
+            egui::Frame::none()
+                .fill(theme.practice.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.practice))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("🎯 Practice Mode Settings")
+                            .size(16.0)
+                            .color(theme.practice)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
                     
-                    for (i, (bpm, beats)) in sections.iter_mut().enumerate() {
+                    ui.label("Practice sections (BPM, Beats):");
+                    
+                    let mut to_remove = None;
+                    let mut sections_changed = false;
+                    
+                    for (i, (bpm, beats)) in practice_state.sections.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(format!("Section {}:", i + 1));
                             
@@ -1077,12 +1260,14 @@ impl MetronomeApp {
                             if ui.add(egui::Slider::new(&mut bpm_f, 30.0..=300.0)
                                 .suffix(" BPM")).changed() {
                                 *bpm = bpm_f as u32;
+                                sections_changed = true;
                             }
                             
                             let mut beats_f = *beats as f32;
                             if ui.add(egui::Slider::new(&mut beats_f, 4.0..=128.0)
                                 .suffix(" beats")).changed() {
                                 *beats = beats_f as u32;
+                                sections_changed = true;
                             }
                             
                             if ui.button("❌").clicked() {
@@ -1092,178 +1277,218 @@ impl MetronomeApp {
                     }
                     
                     if let Some(index) = to_remove {
-                        sections.remove(index);
+                        practice_state.sections.remove(index);
+                        sections_changed = true;
                     }
                     
                     ui.add_space(10.0);
                     if ui.button("➕ Add Section").clicked() {
-                        sections.push((120, 32));
+                        practice_state.sections.push((120, 32));
+                        sections_changed = true;
                     }
-                }
-                
-                let current_section = self.state.current_section.load(Ordering::Relaxed);
-                let section_remaining = self.state.section_remaining.load(Ordering::Relaxed);
-                
-                if self.state.is_running.load(Ordering::Relaxed) {
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Current: Section {} - {} beats remaining", 
-                            current_section + 1, 
-                            section_remaining
-                        ))
-                        .color(theme.practice),
-                    );
-                }
-            });
+                    
+                    if sections_changed {
+                        let _ = self.command_sender.send(MetronomeCommand::UpdatePracticeSettings {
+                            sections: practice_state.sections.clone(),
+                        });
+                    }
+                    
+                    let is_running = self.shared_state.is_running.load(Ordering::Relaxed);
+                    if is_running {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Current: Section {} - {} beats remaining", 
+                                practice_state.current_section + 1, 
+                                practice_state.section_remaining
+                            ))
+                            .color(theme.practice),
+                        );
+                    }
+                });
+        }
     }
     
     fn draw_polyrhythm_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        egui::Frame::none()
-            .fill(theme.polyrhythm.gamma_multiply(0.2))
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(15.0))
-            .stroke(egui::Stroke::new(2.0, theme.polyrhythm))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("🔄 Polyrhythm Mode Settings")
-                        .size(16.0)
-                        .color(theme.polyrhythm)
-                        .strong(),
-                );
-                ui.add_space(10.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Primary rhythm:");
-                    let mut primary = self.state.poly_primary.load(Ordering::Relaxed) as f32;
-                    if ui.add(egui::Slider::new(&mut primary, 2.0..=16.0)).changed() {
-                        self.state.poly_primary.store(primary as u32, Ordering::Relaxed);
-                    }
+        if let Ok(poly_state) = self.shared_state.polyrhythm_state.try_read() {
+            let mut primary = poly_state.primary;
+            let mut secondary = poly_state.secondary;
+            let mut accent_primary = poly_state.accent_primary;
+            let mut accent_secondary = poly_state.accent_secondary;
+            let mut changed = false;
+            
+            egui::Frame::none()
+                .fill(theme.polyrhythm.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.polyrhythm))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("🔄 Polyrhythm Mode Settings")
+                            .size(16.0)
+                            .color(theme.polyrhythm)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
                     
-                    let mut accent_primary = self.state.poly_accent_primary.load(Ordering::Relaxed);
-                    if ui.checkbox(&mut accent_primary, "Accent").changed() {
-                        self.state.poly_accent_primary.store(accent_primary, Ordering::Relaxed);
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Primary rhythm:");
+                        let mut primary_f = primary as f32;
+                        if ui.add(egui::Slider::new(&mut primary_f, 2.0..=16.0)).changed() {
+                            primary = primary_f as u32;
+                            changed = true;
+                        }
+                        
+                        if ui.checkbox(&mut accent_primary, "Accent").changed() {
+                            changed = true;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Secondary rhythm:");
+                        let mut secondary_f = secondary as f32;
+                        if ui.add(egui::Slider::new(&mut secondary_f, 2.0..=16.0)).changed() {
+                            secondary = secondary_f as u32;
+                            changed = true;
+                        }
+                        
+                        if ui.checkbox(&mut accent_secondary, "Accent").changed() {
+                            changed = true;
+                        }
+                    });
+                    
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new("💡 Creates overlapping rhythmic patterns")
+                            .size(12.0)
+                            .color(theme.polyrhythm),
+                    );
                 });
                 
-                ui.horizontal(|ui| {
-                    ui.label("Secondary rhythm:");
-                    let mut secondary = self.state.poly_secondary.load(Ordering::Relaxed) as f32;
-                    if ui.add(egui::Slider::new(&mut secondary, 2.0..=16.0)).changed() {
-                        self.state.poly_secondary.store(secondary as u32, Ordering::Relaxed);
-                    }
-                    
-                    let mut accent_secondary = self.state.poly_accent_secondary.load(Ordering::Relaxed);
-                    if ui.checkbox(&mut accent_secondary, "Accent").changed() {
-                        self.state.poly_accent_secondary.store(accent_secondary, Ordering::Relaxed);
-                    }
+            if changed {
+                let _ = self.command_sender.send(MetronomeCommand::UpdatePolyrhythmSettings {
+                    primary,
+                    secondary,
+                    accent_primary,
+                    accent_secondary,
                 });
-                
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new("💡 Creates overlapping rhythmic patterns")
-                        .size(12.0)
-                        .color(theme.polyrhythm),
-                );
-            });
+            }
+        }
     }
     
     fn draw_ritardando_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        egui::Frame::none()
-            .fill(theme.error.gamma_multiply(0.2))
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(15.0))
-            .stroke(egui::Stroke::new(2.0, theme.error))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("🐌 Ritardando Mode Settings")
-                        .size(16.0)
-                        .color(theme.error)
-                        .strong(),
-                );
-                ui.add_space(10.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Start BPM:");
-                    let mut start_bpm = self.state.start_bpm.load(Ordering::Relaxed) as f32;
-                    if ui.add(egui::Slider::new(&mut start_bpm, 60.0..=300.0)).changed() {
-                        self.state.start_bpm.store(start_bpm as u32, Ordering::Relaxed);
-                        self.state.bpm.store(start_bpm as u32, Ordering::Relaxed);
-                    }
-                });
-                
-                ui.horizontal(|ui| {
-                    ui.label("Target BPM:");
-                    let mut target_bpm = self.state.target_bpm.load(Ordering::Relaxed) as f32;
-                    if ui.add(egui::Slider::new(&mut target_bpm, 30.0..=250.0)).changed() {
-                        self.state.target_bpm.store(target_bpm as u32, Ordering::Relaxed);
-                    }
-                });
-                
-                ui.horizontal(|ui| {
-                    ui.label("Duration:");
-                    let mut duration = self.state.tempo_change_duration.load(Ordering::Relaxed) as f32;
-                    if ui.add(egui::Slider::new(&mut duration, 1.0..=256.0).suffix(" beats")).changed() {
-                        // Ensure minimum value is at least 1 to prevent division by zero
-                        let safe_duration = (duration as u32).max(1);
-                        self.state.tempo_change_duration.store(safe_duration, Ordering::Relaxed);
-                    }
-                });
-                
-                if self.state.is_running.load(Ordering::Relaxed) {
-                    let remaining = self.state.tempo_change_remaining.load(Ordering::Relaxed);
-                    ui.add_space(10.0);
+        if let Ok(ritardando_state) = self.shared_state.ritardando_state.try_read() {
+            let mut start_bpm = ritardando_state.start_bpm;
+            let mut target_bpm = ritardando_state.target_bpm;
+            let mut duration = ritardando_state.duration;
+            let mut changed = false;
+            
+            egui::Frame::none()
+                .fill(theme.error.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.error))
+                .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!("Slowing down... {} beats remaining", remaining))
-                            .color(theme.error),
+                        egui::RichText::new("🐌 Ritardando Mode Settings")
+                            .size(16.0)
+                            .color(theme.error)
+                            .strong(),
                     );
-                }
-            });
+                    ui.add_space(10.0);
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Start BPM:");
+                        let mut start_bpm_f = start_bpm as f32;
+                        if ui.add(egui::Slider::new(&mut start_bpm_f, 60.0..=300.0)).changed() {
+                            start_bpm = start_bpm_f as u32;
+                            changed = true;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Target BPM:");
+                        let mut target_bpm_f = target_bpm as f32;
+                        if ui.add(egui::Slider::new(&mut target_bpm_f, 30.0..=250.0)).changed() {
+                            target_bpm = target_bpm_f as u32;
+                            changed = true;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Duration:");
+                        let mut duration_f = duration as f32;
+                        if ui.add(egui::Slider::new(&mut duration_f, 1.0..=256.0).suffix(" beats")).changed() {
+                            duration = (duration_f as u32).max(1);
+                            changed = true;
+                        }
+                    });
+                    
+                    if self.shared_state.is_running.load(Ordering::Relaxed) {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!("Slowing down... {} beats remaining", ritardando_state.remaining))
+                                .color(theme.error),
+                        );
+                    }
+                });
+                
+            if changed {
+                let _ = self.command_sender.send(MetronomeCommand::UpdateRitardandoSettings {
+                    start_bpm,
+                    target_bpm,
+                    duration,
+                });
+            }
+        }
     }
     
     fn draw_subdivision_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        egui::Frame::none()
-            .fill(theme.primary.gamma_multiply(0.2))
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(15.0))
-            .stroke(egui::Stroke::new(2.0, theme.primary))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("🎼 Subdivision Mode Settings")
-                        .size(16.0)
-                        .color(theme.primary)
-                        .strong(),
-                );
-                ui.add_space(10.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Subdivision:");
-                    let current_sub = self.state.subdivisions.load(Ordering::Relaxed);
+        if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+            let mut subdivisions = subdivision_state.subdivisions;
+            let mut pattern = subdivision_state.accent_pattern.clone();
+            let mut changed = false;
+            
+            egui::Frame::none()
+                .fill(theme.primary.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.primary))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("🎼 Subdivision Mode Settings")
+                            .size(16.0)
+                            .color(theme.primary)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
                     
-                    let subdivisions = [(1, "Quarter"), (2, "Eighth"), (3, "Triplet"), (4, "Sixteenth")];
-                    for (value, name) in subdivisions.iter() {
-                        let selected = current_sub == *value;
-                        let button_color = if selected { theme.primary } else { theme.surface };
+                    ui.horizontal(|ui| {
+                        ui.label("Subdivision:");
                         
-                        if ui.add_sized([80.0, 25.0], 
-                            egui::Button::new(*name).fill(button_color)).clicked() {
-                            self.state.subdivisions.store(*value, Ordering::Relaxed);
+                        let subdivision_options = [(1, "Quarter"), (2, "Eighth"), (3, "Triplet"), (4, "Sixteenth")];
+                        for (value, name) in subdivision_options.iter() {
+                            let selected = subdivisions == *value;
+                            let button_color = if selected { theme.primary } else { theme.surface };
+                            
+                            if ui.add_sized([80.0, 25.0], 
+                                egui::Button::new(*name).fill(button_color)).clicked() {
+                                subdivisions = *value;
+                                changed = true;
+                            }
                         }
-                    }
-                });
-                
-                ui.add_space(10.0);
-                ui.label("Accent Pattern:");
-                
-                if let Ok(mut pattern) = self.state.accent_pattern.try_lock() {
-                    let subdivisions = self.state.subdivisions.load(Ordering::Relaxed) as usize;
+                    });
+                    
+                    ui.add_space(10.0);
+                    ui.label("Accent Pattern:");
                     
                     // Resize pattern if needed
-                    if pattern.len() != subdivisions {
-                        pattern.resize(subdivisions, false);
+                    if pattern.len() != subdivisions as usize {
+                        pattern.resize(subdivisions as usize, false);
                         if subdivisions > 0 {
                             pattern[0] = true; // Always accent the first beat
                         }
+                        changed = true;
                     }
                     
                     ui.horizontal(|ui| {
@@ -1274,18 +1499,26 @@ impl MetronomeApp {
                             if ui.add_sized([40.0, 30.0], 
                                 egui::Button::new(button_text).fill(button_color)).clicked() {
                                 *accent = !*accent;
+                                changed = true;
                             }
                         }
                     });
-                }
+                    
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new("💡 Click beats to toggle accents")
+                            .size(12.0)
+                            .color(theme.primary),
+                    );
+                });
                 
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new("💡 Click beats to toggle accents")
-                        .size(12.0)
-                        .color(theme.primary),
-                );
-            });
+            if changed {
+                let _ = self.command_sender.send(MetronomeCommand::UpdateSubdivisionSettings {
+                    subdivisions,
+                    pattern,
+                });
+            }
+        }
     }
 }
 
