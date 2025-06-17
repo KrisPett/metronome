@@ -26,6 +26,7 @@ enum MetronomeMode {
     Polyrhythm,
     Ritardando,
     Subdivision,
+    Countdown,
 }
 
 // Commands sent to the metronome thread
@@ -42,6 +43,7 @@ enum MetronomeCommand {
     UpdatePolyrhythmSettings { primary: u32, secondary: u32, accent_primary: bool, accent_secondary: bool },
     UpdateRitardandoSettings { start_bpm: u32, target_bpm: u32, duration: u32 },
     UpdateSubdivisionSettings { subdivisions: u32, pattern: Vec<bool> },
+    UpdateCountdownSettings { duration_seconds: u32, enable_random_bpm: bool },
     Reset,
 }
 
@@ -51,6 +53,7 @@ enum MetronomeEvent {
     Beat { tick_count: u32, is_accent: bool },
     ModeChanged { mode: MetronomeMode },
     BpmChanged { bpm: u32 },
+    CountdownFinished,
     Error { message: String },
 }
 
@@ -66,6 +69,8 @@ struct MetronomeApp {
     animation_progress: f32,
     beat_progress: f32,
     last_beat_time: Instant,
+    celebration_animation: f32,
+    celebration_time: Instant,
     
     // Audio resources
     _stream: OutputStream,
@@ -91,6 +96,7 @@ struct SharedMetronomeState {
     polyrhythm_state: RwLock<PolyrhythmState>,
     ritardando_state: RwLock<RitardandoState>,
     subdivision_state: RwLock<SubdivisionState>,
+    countdown_state: RwLock<CountdownState>,
     
     // Beat timing
     last_beat: RwLock<Instant>,
@@ -129,6 +135,58 @@ struct RitardandoState {
 struct SubdivisionState {
     subdivisions: u32,
     accent_pattern: Vec<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct CountdownState {
+    duration_seconds: u32,
+    remaining_seconds: f32,
+    enable_random_bpm: bool,
+    original_bpm: u32,
+    next_bpm_change: f32,
+}
+
+// Helper function to create celebration sound
+fn create_celebration_sound() -> Vec<f32> {
+    let sample_rate = 44100;
+    let duration = 2.0; // 2 seconds
+    let mut samples = Vec::new();
+    
+    // Create a celebratory chord progression
+    let frequencies = [
+        [523.25, 659.25, 783.99], // C major chord
+        [587.33, 739.99, 880.0],  // D major chord
+        [659.25, 830.61, 987.77], // E major chord
+        [698.46, 880.0, 1046.5],  // F major chord
+    ];
+    
+    for chord_idx in 0..frequencies.len() {
+        let chord_duration = duration / frequencies.len() as f32;
+        let chord_samples = (sample_rate as f32 * chord_duration) as usize;
+        
+        for i in 0..chord_samples {
+            let t = i as f32 / sample_rate as f32;
+            let mut sample = 0.0;
+            
+            // Add each note in the chord
+            for &freq in &frequencies[chord_idx] {
+                sample += (t * freq * 2.0 * PI).sin() * 0.2;
+            }
+            
+            // Add some envelope
+            let envelope = if t < 0.1 {
+                t / 0.1
+            } else if t > chord_duration - 0.1 {
+                (chord_duration - t) / 0.1
+            } else {
+                1.0
+            };
+            
+            samples.push(sample * envelope);
+        }
+    }
+    
+    samples
 }
 
 impl Default for MetronomeApp {
@@ -172,12 +230,19 @@ impl Default for MetronomeApp {
                 subdivisions: 1,
                 accent_pattern: vec![true, false, false, false],
             }),
+            countdown_state: RwLock::new(CountdownState {
+                duration_seconds: 60,
+                remaining_seconds: 60.0,
+                enable_random_bpm: false,
+                original_bpm: 120,
+                next_bpm_change: 5.0,
+            }),
             last_beat: RwLock::new(Instant::now()),
         });
 
-        // Create sound cache
+        // Create sound cache including celebration sound
         let mut sound_cache = HashMap::new();
-        for i in 0..8 {
+        for i in 0..9 { // Increased to include celebration sound
             let sound_data = match i {
                 0 => create_beep_sound(),
                 1 => create_kick_sound(),
@@ -187,6 +252,7 @@ impl Default for MetronomeApp {
                 5 => create_wood_block_sound(),
                 6 => create_triangle_sound(),
                 7 => create_square_sound(),
+                8 => create_celebration_sound(), // New celebration sound
                 _ => create_beep_sound(),
             };
             sound_cache.insert(i, sound_data);
@@ -207,6 +273,8 @@ impl Default for MetronomeApp {
             animation_progress: 0.0,
             beat_progress: 0.0,
             last_beat_time: Instant::now(),
+            celebration_animation: 0.0,
+            celebration_time: Instant::now(),
             _stream,
             stream_handle,
         }
@@ -223,6 +291,7 @@ impl SharedMetronomeState {
             3 => MetronomeMode::Polyrhythm,
             4 => MetronomeMode::Ritardando,
             5 => MetronomeMode::Subdivision,
+            6 => MetronomeMode::Countdown,
             _ => MetronomeMode::Standard,
         }
     }
@@ -244,6 +313,7 @@ struct Theme {
     warning: egui::Color32,
     polyrhythm: egui::Color32,
     practice: egui::Color32,
+    countdown: egui::Color32,
 }
 
 impl Theme {
@@ -260,6 +330,7 @@ impl Theme {
             warning: egui::Color32::from_rgb(255, 193, 7),
             polyrhythm: egui::Color32::from_rgb(255, 64, 129),
             practice: egui::Color32::from_rgb(0, 188, 212),
+            countdown: egui::Color32::from_rgb(255, 87, 34),
         }
     }
 }
@@ -273,6 +344,7 @@ fn metronome_thread(
 ) {
     let mut last_tick = Instant::now();
     let mut subdivision_tick = 0u32;
+    let mut countdown_start_time = Instant::now();
     
     // Local state for the metronome thread
     let mut local_random_state = state.random_state.read().unwrap().clone();
@@ -280,6 +352,7 @@ fn metronome_thread(
     let mut local_polyrhythm_state = state.polyrhythm_state.read().unwrap().clone();
     let mut local_ritardando_state = state.ritardando_state.read().unwrap().clone();
     let mut local_subdivision_state = state.subdivision_state.read().unwrap().clone();
+    let mut local_countdown_state = state.countdown_state.read().unwrap().clone();
 
     loop {
         // Process commands (non-blocking)
@@ -289,6 +362,7 @@ fn metronome_thread(
                     state.is_running.store(true, Ordering::Relaxed);
                     state.tick_count.store(0, Ordering::Relaxed);
                     last_tick = Instant::now();
+                    countdown_start_time = Instant::now();
                     subdivision_tick = 0;
                     
                     // Reset mode-specific state
@@ -304,6 +378,11 @@ fn metronome_thread(
                         MetronomeMode::Ritardando => {
                             local_ritardando_state.remaining = local_ritardando_state.duration;
                             state.bpm.store(local_ritardando_state.start_bpm, Ordering::Relaxed);
+                        },
+                        MetronomeMode::Countdown => {
+                            local_countdown_state.remaining_seconds = local_countdown_state.duration_seconds as f32;
+                            local_countdown_state.original_bpm = state.bpm.load(Ordering::Relaxed);
+                            local_countdown_state.next_bpm_change = 5.0; // Change BPM every 5 seconds
                         },
                         _ => {},
                     }
@@ -345,13 +424,18 @@ fn metronome_thread(
                 MetronomeCommand::UpdateRitardandoSettings { start_bpm, target_bpm, duration } => {
                     local_ritardando_state.start_bpm = start_bpm;
                     local_ritardando_state.target_bpm = target_bpm;
-                    local_ritardando_state.duration = duration.max(1); // Prevent division by zero
+                    local_ritardando_state.duration = duration.max(1);
                     *state.ritardando_state.write().unwrap() = local_ritardando_state.clone();
                 },
                 MetronomeCommand::UpdateSubdivisionSettings { subdivisions, pattern } => {
                     local_subdivision_state.subdivisions = subdivisions;
                     local_subdivision_state.accent_pattern = pattern;
                     *state.subdivision_state.write().unwrap() = local_subdivision_state.clone();
+                },
+                MetronomeCommand::UpdateCountdownSettings { duration_seconds, enable_random_bpm } => {
+                    local_countdown_state.duration_seconds = duration_seconds;
+                    local_countdown_state.enable_random_bpm = enable_random_bpm;
+                    *state.countdown_state.write().unwrap() = local_countdown_state.clone();
                 },
                 MetronomeCommand::Reset => {
                     state.tick_count.store(0, Ordering::Relaxed);
@@ -367,6 +451,52 @@ fn metronome_thread(
             let mut is_accent = false;
             let mut use_alternate_sound = false;
 
+            // Handle countdown mode timing
+            if current_mode == MetronomeMode::Countdown {
+                let elapsed = countdown_start_time.elapsed().as_secs_f32();
+                local_countdown_state.remaining_seconds = (local_countdown_state.duration_seconds as f32 - elapsed).max(0.0);
+                
+                // Check if countdown finished
+                if local_countdown_state.remaining_seconds <= 0.0 {
+                    state.is_running.store(false, Ordering::Relaxed);
+                    
+                    // Play celebration sound
+                    let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
+                    if let Some(celebration_sound) = sound_cache.get(&8) {
+                        let volume_adjusted_sound: Vec<f32> = celebration_sound
+                            .iter()
+                            .map(|&sample| sample * volume * 1.5) // Louder for celebration
+                            .collect();
+                        
+                        let source = SamplesBuffer::new(1, 44100, volume_adjusted_sound);
+                        if let Ok(sink_guard) = sink.try_lock() {
+                            sink_guard.append(source);
+                        }
+                    }
+                    
+                    let _ = event_sender.send(MetronomeEvent::CountdownFinished);
+                    continue;
+                }
+                
+                // Handle random BPM changes during countdown
+                if local_countdown_state.enable_random_bpm {
+                    local_countdown_state.next_bpm_change -= elapsed - (local_countdown_state.duration_seconds as f32 - local_countdown_state.remaining_seconds);
+                    
+                    if local_countdown_state.next_bpm_change <= 0.0 {
+                        let mut rng = rand::thread_rng();
+                        let new_bpm = rng.gen_range(80..=180);
+                        state.bpm.store(new_bpm, Ordering::Relaxed);
+                        local_countdown_state.next_bpm_change = rng.gen_range(3.0..=8.0); // Next change in 3-8 seconds
+                        let _ = event_sender.send(MetronomeEvent::BpmChanged { bpm: new_bpm });
+                    }
+                }
+                
+                // Update shared countdown state
+                if let Ok(mut shared_countdown) = state.countdown_state.try_write() {
+                    *shared_countdown = local_countdown_state.clone();
+                }
+            }
+
             // Calculate beat interval based on mode
             let beat_interval = match current_mode {
                 MetronomeMode::Subdivision => {
@@ -379,7 +509,7 @@ fn metronome_thread(
                     };
                     Duration::from_millis((60000.0 / (effective_bpm as f32 * multiplier)) as u64)
                 },
-                _ => Duration::from_millis(60000 / effective_bpm.max(1) as u64), // Prevent division by zero
+                _ => Duration::from_millis(60000 / effective_bpm.max(1) as u64),
             };
 
             if last_tick.elapsed() >= beat_interval {
@@ -388,6 +518,14 @@ fn metronome_thread(
                 match current_mode {
                     MetronomeMode::Standard => {
                         // Standard mode - just tick
+                    },
+                    
+                    MetronomeMode::Countdown => {
+                        // Countdown mode - accent every 10 seconds
+                        let seconds_elapsed = local_countdown_state.duration_seconds as f32 - local_countdown_state.remaining_seconds;
+                        if seconds_elapsed % 10.0 < 0.5 {
+                            is_accent = true;
+                        }
                     },
                     
                     MetronomeMode::Random => {
@@ -404,7 +542,6 @@ fn metronome_thread(
                             let _ = event_sender.send(MetronomeEvent::BpmChanged { bpm: new_bpm });
                         }
                         
-                        // Update shared state
                         if let Ok(mut shared_random) = state.random_state.try_write() {
                             *shared_random = local_random_state.clone();
                         }
@@ -412,7 +549,6 @@ fn metronome_thread(
                     
                     MetronomeMode::Practice => {
                         if local_practice_state.section_remaining == 0 {
-                            // Move to next section
                             let current_section = local_practice_state.current_section as usize;
                             
                             if current_section < local_practice_state.sections.len() {
@@ -420,7 +556,6 @@ fn metronome_thread(
                                 state.bpm.store(section_bpm, Ordering::Relaxed);
                                 local_practice_state.section_remaining = section_beats;
                                 
-                                // Move to next section for next time
                                 let next_section = (current_section + 1) % local_practice_state.sections.len();
                                 local_practice_state.current_section = next_section as u32;
                                 
@@ -430,7 +565,6 @@ fn metronome_thread(
                         
                         local_practice_state.section_remaining = local_practice_state.section_remaining.saturating_sub(1);
                         
-                        // Update shared state
                         if let Ok(mut shared_practice) = state.practice_state.try_write() {
                             *shared_practice = local_practice_state.clone();
                         }
@@ -439,9 +573,7 @@ fn metronome_thread(
                     MetronomeMode::Polyrhythm => {
                         let tick_count = state.tick_count.load(Ordering::Relaxed);
                         
-                        // Check if this tick aligns with primary rhythm
                         let primary_hit = local_polyrhythm_state.primary > 0 && (tick_count % local_polyrhythm_state.primary) == 0;
-                        // Check if this tick aligns with secondary rhythm  
                         let secondary_hit = local_polyrhythm_state.secondary > 0 && (tick_count % local_polyrhythm_state.secondary) == 0;
                         
                         if primary_hit && local_polyrhythm_state.accent_primary {
@@ -461,20 +593,17 @@ fn metronome_thread(
                         let target_bpm = local_ritardando_state.target_bpm as f32;
                         let duration = local_ritardando_state.duration as f32;
                         
-                        // Prevent division by zero
                         if duration > 0.0 {
                             let progress = (duration - local_ritardando_state.remaining as f32) / duration;
                             let current_bpm = start_bpm - (start_bpm - target_bpm) * progress;
-                            let current_bpm_u32 = (current_bpm as u32).max(1); // Ensure at least 1 BPM
+                            let current_bpm_u32 = (current_bpm as u32).max(1);
                             state.bpm.store(current_bpm_u32, Ordering::Relaxed);
                         } else {
-                            // If duration is 0, just set to target BPM
                             state.bpm.store(local_ritardando_state.target_bpm, Ordering::Relaxed);
                         }
                         
                         local_ritardando_state.remaining = local_ritardando_state.remaining.saturating_sub(1);
                         
-                        // Update shared state
                         if let Ok(mut shared_ritardando) = state.ritardando_state.try_write() {
                             *shared_ritardando = local_ritardando_state.clone();
                         }
@@ -493,12 +622,10 @@ fn metronome_thread(
                 if should_tick {
                     let new_tick_count = state.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-                    // Update last beat time atomically
                     if let Ok(mut last_beat) = state.last_beat.try_write() {
                         *last_beat = Instant::now();
                     }
 
-                    // Send beat event
                     let _ = event_sender.send(MetronomeEvent::Beat {
                         tick_count: new_tick_count,
                         is_accent,
@@ -508,13 +635,12 @@ fn metronome_thread(
                     let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
                     let mut sound_type = state.sound_type.load(Ordering::Relaxed);
                     
-                    // Modify sound based on accent or alternate sound
                     if use_alternate_sound {
-                        sound_type = (sound_type + 1) % 8; // Use next sound in list
+                        sound_type = (sound_type + 1) % 8;
                     }
                     
                     let final_volume = if is_accent { 
-                        (volume * 1.5).min(1.0) // Cap at 100%
+                        (volume * 1.5).min(1.0)
                     } else { 
                         volume 
                     };
@@ -549,14 +675,13 @@ impl eframe::App for MetronomeApp {
             match event {
                 MetronomeEvent::Beat { is_accent, .. } => {
                     self.last_beat_time = Instant::now();
-                    // Could add visual feedback for accents here
                 },
-                MetronomeEvent::ModeChanged { .. } => {
-                    // Handle mode change notifications
+                MetronomeEvent::CountdownFinished => {
+                    self.celebration_time = Instant::now();
+                    self.celebration_animation = 1.0;
                 },
-                MetronomeEvent::BpmChanged { .. } => {
-                    // Handle BPM change notifications
-                },
+                MetronomeEvent::ModeChanged { .. } => {},
+                MetronomeEvent::BpmChanged { .. } => {},
                 MetronomeEvent::Error { message } => {
                     eprintln!("Metronome error: {}", message);
                 },
@@ -587,6 +712,13 @@ impl eframe::App for MetronomeApp {
         let tick_count = self.shared_state.tick_count.load(Ordering::Relaxed);
         let current_mode = self.shared_state.get_mode();
 
+        // Handle celebration animation
+        if self.celebration_animation > 0.0 {
+            let elapsed = self.celebration_time.elapsed().as_secs_f32();
+            self.celebration_animation = (3.0 - elapsed).max(0.0) / 3.0;
+            ctx.request_repaint();
+        }
+
         if is_running {
             if let Ok(last_beat) = self.shared_state.last_beat.try_read() {
                 let time_since_beat = last_beat.elapsed().as_millis() as f32;
@@ -603,7 +735,7 @@ impl eframe::App for MetronomeApp {
                     },
                     _ => bpm as f32,
                 };
-                let beat_interval_ms = 60000.0 / effective_bpm.max(1.0); // Prevent division by zero
+                let beat_interval_ms = 60000.0 / effective_bpm.max(1.0);
 
                 self.beat_progress = (time_since_beat / beat_interval_ms).min(1.0);
 
@@ -625,6 +757,18 @@ impl eframe::App for MetronomeApp {
                 .show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
+                
+                // Show celebration effects if active
+                if self.celebration_animation > 0.0 {
+                    ui.heading(
+                        egui::RichText::new("🎉 COUNTDOWN COMPLETE! 🎉")
+                            .size(40.0)
+                            .color(egui::Color32::from_rgb(255, 215, 0))
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                }
+                
                 ui.heading(
                     egui::RichText::new("🎵 METRONOME STUDIO PRO")
                         .size(32.0)
@@ -665,6 +809,7 @@ impl eframe::App for MetronomeApp {
                         (MetronomeMode::Polyrhythm, "🔄", "Polyrhythm"),
                         (MetronomeMode::Ritardando, "🐌", "Ritardando"),
                         (MetronomeMode::Subdivision, "🎼", "Subdivision"),
+                        (MetronomeMode::Countdown, "⏱️", "Countdown"),
                     ];
 
                     ui.horizontal_wrapped(|ui| {
@@ -676,6 +821,7 @@ impl eframe::App for MetronomeApp {
                                     MetronomeMode::Practice => theme.practice,
                                     MetronomeMode::Polyrhythm => theme.polyrhythm,
                                     MetronomeMode::Ritardando => theme.error,
+                                    MetronomeMode::Countdown => theme.countdown,
                                     _ => theme.primary,
                                 }
                             } else {
@@ -708,6 +854,7 @@ impl eframe::App for MetronomeApp {
                 MetronomeMode::Polyrhythm => self.draw_polyrhythm_controls(ui, &theme),
                 MetronomeMode::Ritardando => self.draw_ritardando_controls(ui, &theme),
                 MetronomeMode::Subdivision => self.draw_subdivision_controls(ui, &theme),
+                MetronomeMode::Countdown => self.draw_countdown_controls(ui, &theme),
                 _ => {},
             }
 
@@ -723,13 +870,29 @@ impl eframe::App for MetronomeApp {
                     base_size
                 };
 
+                // Add celebration glow effect
+                let celebration_glow = if self.celebration_animation > 0.0 {
+                    self.celebration_animation * 50.0
+                } else {
+                    0.0
+                };
+
                 let beat_color = if is_running {
-                    if self.animation_progress > 0.0 {
-                        let intensity = 0.3 + self.animation_progress * 0.7;
+                    if self.animation_progress > 0.0 || self.celebration_animation > 0.0 {
+                        let intensity = if self.celebration_animation > 0.0 {
+                            self.celebration_animation
+                        } else {
+                            0.3 + self.animation_progress * 0.7
+                        };
                         match current_mode {
                             MetronomeMode::Random => theme.warning,
                             MetronomeMode::Practice => theme.practice,
                             MetronomeMode::Polyrhythm => theme.polyrhythm,
+                            MetronomeMode::Countdown => if self.celebration_animation > 0.0 {
+                                egui::Color32::from_rgb(255, 215, 0) // Gold for celebration
+                            } else {
+                                theme.countdown
+                            },
                             _ => egui::Color32::from_rgb(
                                 (138.0 + (255.0 - 138.0) * intensity) as u8,
                                 (43.0 + (255.0 - 43.0) * intensity) as u8,
@@ -741,6 +904,7 @@ impl eframe::App for MetronomeApp {
                             MetronomeMode::Random => theme.warning,
                             MetronomeMode::Practice => theme.practice,
                             MetronomeMode::Polyrhythm => theme.polyrhythm,
+                            MetronomeMode::Countdown => theme.countdown,
                             _ => theme.primary,
                         }
                     }
@@ -748,13 +912,36 @@ impl eframe::App for MetronomeApp {
                     egui::Color32::from_gray(80)
                 };
 
-                let fixed_size = max_size + 40.0;
+                let fixed_size = max_size + 40.0 + celebration_glow;
                 let (rect, _) =
                     ui.allocate_exact_size([fixed_size, fixed_size].into(), egui::Sense::hover());
 
-                if is_running && self.animation_progress > 0.0 {
-                    let glow_radius = pulse_size / 2.0 + 15.0;
-                    let glow_alpha = (self.animation_progress * 50.0) as u8;
+                // Draw celebration effects
+                if self.celebration_animation > 0.0 {
+                    for i in 0..8 {
+                        let angle = (i as f32 * PI * 2.0 / 8.0) + (self.celebration_time.elapsed().as_secs_f32() * 2.0);
+                        let radius = pulse_size / 2.0 + 30.0 + (self.celebration_animation * 20.0);
+                        let star_pos = rect.center() + egui::Vec2::new(
+                            angle.cos() * radius,
+                            angle.sin() * radius,
+                        );
+                        ui.painter().text(
+                            star_pos,
+                            egui::Align2::CENTER_CENTER,
+                            "⭐",
+                            egui::FontId::proportional(20.0 * self.celebration_animation),
+                            egui::Color32::from_rgb(255, 215, 0),
+                        );
+                    }
+                }
+
+                if (is_running && self.animation_progress > 0.0) || self.celebration_animation > 0.0 {
+                    let glow_radius = pulse_size / 2.0 + 15.0 + celebration_glow;
+                    let glow_alpha = if self.celebration_animation > 0.0 {
+                        (self.celebration_animation * 100.0) as u8
+                    } else {
+                        (self.animation_progress * 50.0) as u8
+                    };
                     ui.painter().circle_filled(
                         rect.center(),
                         glow_radius,
@@ -776,6 +963,8 @@ impl eframe::App for MetronomeApp {
 
                 let symbol_size = if self.animation_progress > 0.0 {
                     40.0 + self.animation_progress * 8.0
+                } else if self.celebration_animation > 0.0 {
+                    40.0 + self.celebration_animation * 15.0
                 } else {
                     40.0
                 };
@@ -785,6 +974,7 @@ impl eframe::App for MetronomeApp {
                     MetronomeMode::Polyrhythm => "🔄",
                     MetronomeMode::Ritardando => "🐌",
                     MetronomeMode::Subdivision => "🎼",
+                    MetronomeMode::Countdown => if self.celebration_animation > 0.0 { "🎉" } else { "⏱️" },
                     _ => "♪",
                 };
                 ui.painter().text(
@@ -806,64 +996,85 @@ impl eframe::App for MetronomeApp {
 
             ui.add_space(20.0);
 
-            // Beat progress bar
+            // Beat progress bar or countdown progress
             ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Beat Progress")
-                        .size(14.0)
-                        .color(theme.accent),
-                );
-                ui.add_space(5.0);
-
-                let slider_width = 400.0;
-                let slider_height = 12.0;
-                let slider_rect = ui
-                    .allocate_space([slider_width, slider_height + 20.0].into())
-                    .1;
-
-                let track_rect = egui::Rect::from_center_size(
-                    slider_rect.center(),
-                    egui::Vec2::new(slider_width, slider_height),
-                );
-                ui.painter().rect_filled(
-                    track_rect,
-                    egui::Rounding::same(slider_height / 2.0),
-                    egui::Color32::from_gray(40),
-                );
-
-                let progress_width = slider_width * self.beat_progress;
-                let progress_rect = egui::Rect::from_min_size(
-                    track_rect.min,
-                    egui::Vec2::new(progress_width, slider_height),
-                );
-
-                let progress_color = if is_running {
-                    if self.animation_progress > 0.5 {
-                        egui::Color32::from_rgb(255, 255, 255)
-                    } else {
-                        match current_mode {
-                            MetronomeMode::Random => theme.warning,
-                            MetronomeMode::Practice => theme.practice,
-                            MetronomeMode::Polyrhythm => theme.polyrhythm,
-                            _ => theme.primary,
-                        }
-                    }
+                if current_mode == MetronomeMode::Countdown {
+                    self.draw_countdown_progress(ui, &theme);
                 } else {
-                    egui::Color32::from_gray(60)
-                };
+                    ui.label(
+                        egui::RichText::new("Beat Progress")
+                            .size(14.0)
+                            .color(theme.accent),
+                    );
+                    ui.add_space(5.0);
 
-                ui.painter().rect_filled(
-                    progress_rect,
-                    egui::Rounding::same(slider_height / 2.0),
-                    progress_color,
-                );
+                    let slider_width = 400.0;
+                    let slider_height = 12.0;
+                    let slider_rect = ui
+                        .allocate_space([slider_width, slider_height + 20.0].into())
+                        .1;
 
-                // Subdivision marks for subdivision mode
-                if current_mode == MetronomeMode::Subdivision {
-                    if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
-                        let subdivisions = subdivision_state.subdivisions;
-                        for i in 1..subdivisions {
-                            let tick_x = track_rect.min.x + (slider_width * i as f32) / subdivisions as f32;
+                    let track_rect = egui::Rect::from_center_size(
+                        slider_rect.center(),
+                        egui::Vec2::new(slider_width, slider_height),
+                    );
+                    ui.painter().rect_filled(
+                        track_rect,
+                        egui::Rounding::same(slider_height / 2.0),
+                        egui::Color32::from_gray(40),
+                    );
+
+                    let progress_width = slider_width * self.beat_progress;
+                    let progress_rect = egui::Rect::from_min_size(
+                        track_rect.min,
+                        egui::Vec2::new(progress_width, slider_height),
+                    );
+
+                    let progress_color = if is_running {
+                        if self.animation_progress > 0.5 {
+                            egui::Color32::from_rgb(255, 255, 255)
+                        } else {
+                            match current_mode {
+                                MetronomeMode::Random => theme.warning,
+                                MetronomeMode::Practice => theme.practice,
+                                MetronomeMode::Polyrhythm => theme.polyrhythm,
+                                MetronomeMode::Countdown => theme.countdown,
+                                _ => theme.primary,
+                            }
+                        }
+                    } else {
+                        egui::Color32::from_gray(60)
+                    };
+
+                    ui.painter().rect_filled(
+                        progress_rect,
+                        egui::Rounding::same(slider_height / 2.0),
+                        progress_color,
+                    );
+
+                    // Subdivision marks for subdivision mode
+                    if current_mode == MetronomeMode::Subdivision {
+                        if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                            let subdivisions = subdivision_state.subdivisions;
+                            for i in 1..subdivisions {
+                                let tick_x = track_rect.min.x + (slider_width * i as f32) / subdivisions as f32;
+                                let tick_top = track_rect.min.y - 3.0;
+                                let tick_bottom = track_rect.max.y + 3.0;
+
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(tick_x, tick_top),
+                                        egui::pos2(tick_x, tick_bottom),
+                                    ],
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                                );
+                            }
+                        }
+                    } else {
+                        let num_subdivisions = 4;
+                        for i in 1..num_subdivisions {
+                            let tick_x =
+                                track_rect.min.x + (slider_width * i as f32) / num_subdivisions as f32;
                             let tick_top = track_rect.min.y - 3.0;
                             let tick_bottom = track_rect.max.y + 3.0;
 
@@ -876,45 +1087,29 @@ impl eframe::App for MetronomeApp {
                             );
                         }
                     }
-                } else {
-                    let num_subdivisions = 4;
-                    for i in 1..num_subdivisions {
-                        let tick_x =
-                            track_rect.min.x + (slider_width * i as f32) / num_subdivisions as f32;
-                        let tick_top = track_rect.min.y - 3.0;
-                        let tick_bottom = track_rect.max.y + 3.0;
 
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(tick_x, tick_top),
-                                egui::pos2(tick_x, tick_bottom),
-                            ],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                    if is_running {
+                        let effective_bpm = match current_mode {
+                            MetronomeMode::Subdivision => {
+                                if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
+                                    let multiplier = match subdivision_state.subdivisions {
+                                        1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
+                                    };
+                                    bpm as f32 * multiplier
+                                } else {
+                                    bpm as f32
+                                }
+                            },
+                            _ => bpm as f32,
+                        };
+                        let time_to_next_beat = (60000.0 / effective_bpm.max(1.0)) * (1.0 - self.beat_progress);
+                        ui.add_space(15.0);
+                        ui.label(
+                            egui::RichText::new(format!("Next beat in: {:.1}ms", time_to_next_beat))
+                                .size(12.0)
+                                .color(theme.accent),
                         );
                     }
-                }
-
-                if is_running {
-                    let effective_bpm = match current_mode {
-                        MetronomeMode::Subdivision => {
-                            if let Ok(subdivision_state) = self.shared_state.subdivision_state.try_read() {
-                                let multiplier = match subdivision_state.subdivisions {
-                                    1 => 1.0, 2 => 2.0, 3 => 3.0, 4 => 4.0, _ => 1.0,
-                                };
-                                bpm as f32 * multiplier
-                            } else {
-                                bpm as f32
-                            }
-                        },
-                        _ => bpm as f32,
-                    };
-                    let time_to_next_beat = (60000.0 / effective_bpm.max(1.0)) * (1.0 - self.beat_progress);
-                    ui.add_space(15.0);
-                    ui.label(
-                        egui::RichText::new(format!("Next beat in: {:.1}ms", time_to_next_beat))
-                            .size(12.0)
-                            .color(theme.accent),
-                    );
                 }
             });
 
@@ -1154,7 +1349,156 @@ impl MetronomeApp {
                     "Subdivision Mode".to_string()
                 }
             },
+            MetronomeMode::Countdown => {
+                if let Ok(countdown_state) = self.shared_state.countdown_state.try_read() {
+                    let minutes = (countdown_state.remaining_seconds / 60.0) as u32;
+                    let seconds = (countdown_state.remaining_seconds % 60.0) as u32;
+                    format!("Countdown Mode - {}:{:02} remaining", minutes, seconds)
+                } else {
+                    "Countdown Mode".to_string()
+                }
+            },
             MetronomeMode::Standard => "Standard Mode".to_string(),
+        }
+    }
+
+    fn draw_countdown_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        if let Ok(countdown_state) = self.shared_state.countdown_state.try_read() {
+            let mut duration_seconds = countdown_state.duration_seconds;
+            let mut enable_random_bpm = countdown_state.enable_random_bpm;
+            let mut changed = false;
+            
+            egui::Frame::none()
+                .fill(theme.countdown.gamma_multiply(0.2))
+                .rounding(egui::Rounding::same(12.0))
+                .inner_margin(egui::Margin::same(15.0))
+                .stroke(egui::Stroke::new(2.0, theme.countdown))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("⏱️ Countdown Mode Settings")
+                            .size(16.0)
+                            .color(theme.countdown)
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Duration:");
+                        let mut duration_minutes = duration_seconds as f32 / 60.0;
+                        if ui.add(egui::Slider::new(&mut duration_minutes, 0.5..=30.0)
+                            .suffix(" min")).changed() {
+                            duration_seconds = (duration_minutes * 60.0) as u32;
+                            changed = true;
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                    
+                    if ui.checkbox(&mut enable_random_bpm, "🎲 Randomize BPM during countdown").changed() {
+                        changed = true;
+                    }
+                    
+                    if enable_random_bpm {
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new("💡 BPM will randomly change every 3-8 seconds")
+                                .size(12.0)
+                                .color(theme.countdown),
+                        );
+                    }
+                    
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("🎉 A celebration sound will play when countdown completes!")
+                            .size(12.0)
+                            .color(theme.countdown),
+                    );
+                });
+                
+            if changed {
+                let _ = self.command_sender.send(MetronomeCommand::UpdateCountdownSettings {
+                    duration_seconds,
+                    enable_random_bpm,
+                });
+            }
+        }
+    }
+
+    fn draw_countdown_progress(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        if let Ok(countdown_state) = self.shared_state.countdown_state.try_read() {
+            ui.label(
+                egui::RichText::new("⏱️ Countdown Progress")
+                    .size(14.0)
+                    .color(theme.countdown),
+            );
+            ui.add_space(5.0);
+
+            let slider_width = 400.0;
+            let slider_height = 20.0;
+            let slider_rect = ui
+                .allocate_space([slider_width, slider_height + 20.0].into())
+                .1;
+
+            let track_rect = egui::Rect::from_center_size(
+                slider_rect.center(),
+                egui::Vec2::new(slider_width, slider_height),
+            );
+            
+            // Background
+            ui.painter().rect_filled(
+                track_rect,
+                egui::Rounding::same(slider_height / 2.0),
+                egui::Color32::from_gray(40),
+            );
+
+            // Progress fill
+            let progress = if countdown_state.duration_seconds > 0 {
+                1.0 - (countdown_state.remaining_seconds / countdown_state.duration_seconds as f32)
+            } else {
+                0.0
+            };
+            
+            let progress_width = slider_width * progress;
+            let progress_rect = egui::Rect::from_min_size(
+                track_rect.min,
+                egui::Vec2::new(progress_width, slider_height),
+            );
+
+            let progress_color = if countdown_state.remaining_seconds <= 10.0 {
+                theme.error // Red when less than 10 seconds
+            } else if countdown_state.remaining_seconds <= 30.0 {
+                theme.warning // Yellow when less than 30 seconds
+            } else {
+                theme.countdown // Orange otherwise
+            };
+
+            ui.painter().rect_filled(
+                progress_rect,
+                egui::Rounding::same(slider_height / 2.0),
+                progress_color,
+            );
+
+            // Time display
+            let minutes = (countdown_state.remaining_seconds / 60.0) as u32;
+            let seconds = (countdown_state.remaining_seconds % 60.0) as u32;
+            
+            ui.painter().text(
+                track_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}:{:02}", minutes, seconds),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+
+            ui.add_space(15.0);
+            
+            if countdown_state.enable_random_bpm {
+                ui.label(
+                    egui::RichText::new("🎲 Random BPM mode active")
+                        .size(12.0)
+                        .color(theme.countdown),
+                );
+            }
         }
     }
 
