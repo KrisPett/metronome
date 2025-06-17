@@ -1,12 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}, Mutex};
-use std::time::{Duration, Instant};
-use std::thread;
-use rodio::{OutputStream, OutputStreamHandle, buffer::SamplesBuffer, Sink};
 use rand::Rng;
-use std::f32::consts::PI;
+use rodio::{OutputStream, OutputStreamHandle, Sink, buffer::SamplesBuffer};
 use std::collections::HashMap;
+use std::f32::consts::PI;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 struct MetronomeApp {
     state: Arc<MetronomeState>,
@@ -37,7 +40,7 @@ impl Default for MetronomeApp {
     fn default() -> Self {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
         let sink = Arc::new(Mutex::new(Sink::try_new(&stream_handle).unwrap()));
-        
+
         let mut sound_cache = HashMap::new();
         for i in 0..8 {
             let sound_data = match i {
@@ -53,7 +56,7 @@ impl Default for MetronomeApp {
             };
             sound_cache.insert(i, sound_data);
         }
-        
+
         let state = Arc::new(MetronomeState {
             bpm: AtomicU32::new(120),
             is_running: AtomicBool::new(false),
@@ -65,15 +68,15 @@ impl Default for MetronomeApp {
             remaining_ticks: AtomicU32::new(0),
             last_beat: Arc::new(Mutex::new(Instant::now())),
         });
-        
+
         let state_clone = Arc::clone(&state);
         let sink_clone = Arc::clone(&sink);
         let sound_cache_clone = sound_cache.clone();
-        
+
         thread::spawn(move || {
             metronome_thread(state_clone, sink_clone, sound_cache_clone);
         });
-        
+
         Self {
             state,
             animation_progress: 0.0,
@@ -101,78 +104,76 @@ struct Theme {
 impl Theme {
     fn dark() -> Self {
         Self {
-            primary: egui::Color32::from_rgb(138, 43, 226),     
-            secondary: egui::Color32::from_rgb(75, 0, 130),     
-            accent: egui::Color32::from_rgb(255, 140, 0),       
-            background: egui::Color32::from_rgb(18, 18, 18),  
-            surface: egui::Color32::from_rgb(32, 32, 32),       
-            on_surface: egui::Color32::from_rgb(220, 220, 220), 
-            error: egui::Color32::from_rgb(244, 67, 54),        
-            success: egui::Color32::from_rgb(76, 175, 80),      
-            warning: egui::Color32::from_rgb(255, 193, 7),      
+            primary: egui::Color32::from_rgb(138, 43, 226),
+            secondary: egui::Color32::from_rgb(75, 0, 130),
+            accent: egui::Color32::from_rgb(255, 140, 0),
+            background: egui::Color32::from_rgb(18, 18, 18),
+            surface: egui::Color32::from_rgb(32, 32, 32),
+            on_surface: egui::Color32::from_rgb(220, 220, 220),
+            error: egui::Color32::from_rgb(244, 67, 54),
+            success: egui::Color32::from_rgb(76, 175, 80),
+            warning: egui::Color32::from_rgb(255, 193, 7),
         }
     }
 }
 
 fn metronome_thread(
-    state: Arc<MetronomeState>, 
-    sink: Arc<Mutex<Sink>>, 
-    sound_cache: HashMap<u32, Vec<f32>>
+    state: Arc<MetronomeState>,
+    sink: Arc<Mutex<Sink>>,
+    sound_cache: HashMap<u32, Vec<f32>>,
 ) {
     let mut last_tick = Instant::now();
-    
+
     loop {
         if state.is_running.load(Ordering::Relaxed) {
             let bpm = state.bpm.load(Ordering::Relaxed);
             let beat_interval = Duration::from_millis(60000 / bpm as u64);
-            
+
             if last_tick.elapsed() >= beat_interval {
                 state.tick_count.fetch_add(1, Ordering::Relaxed);
-                
+
                 if let Ok(mut last_beat) = state.last_beat.lock() {
                     *last_beat = Instant::now();
                 }
-                
+
                 let volume = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
                 let sound_type = state.sound_type.load(Ordering::Relaxed);
-                
+
                 if let Some(sound_data) = sound_cache.get(&sound_type) {
-                    let volume_adjusted_sound: Vec<f32> = sound_data
-                        .iter()
-                        .map(|&sample| sample * volume)
-                        .collect();
-                    
+                    let volume_adjusted_sound: Vec<f32> =
+                        sound_data.iter().map(|&sample| sample * volume).collect();
+
                     let source = SamplesBuffer::new(1, 44100, volume_adjusted_sound);
-                    
+
                     if let Ok(sink_guard) = sink.lock() {
                         sink_guard.append(source);
                     }
                 }
-                
+
                 if state.random_mode.load(Ordering::Relaxed) {
                     let mut remaining = state.remaining_ticks.load(Ordering::Relaxed);
-                    
+
                     if remaining == 0 {
                         remaining = state.random_count.load(Ordering::Relaxed);
                         state.remaining_ticks.store(remaining, Ordering::Relaxed);
                     }
-                    
+
                     remaining -= 1;
                     state.remaining_ticks.store(remaining, Ordering::Relaxed);
-                    
+
                     if remaining == 0 {
                         let mut rng = rand::thread_rng();
                         let new_bpm = rng.gen_range(60..=150); // set min/max random value
                         state.bpm.store(new_bpm, Ordering::Relaxed);
                     }
                 }
-                
+
                 last_tick = Instant::now();
             }
         } else {
             last_tick = Instant::now();
         }
-        
+
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -255,7 +256,7 @@ fn create_hihat_sound() -> Vec<f32> {
     let samples = (sample_rate * duration_ms / 1000) as usize;
 
     let mut wave: Vec<f32> = Vec::with_capacity(samples);
-    
+
     let mut noise_samples: Vec<f32> = Vec::with_capacity(samples);
     let mut rng = rand::thread_rng();
     for _ in 0..samples {
@@ -293,7 +294,8 @@ fn create_triangle_sound() -> Vec<f32> {
             4.0 * phase - 1.0
         } else {
             3.0 - 4.0 * phase
-        } * 0.2 * envelope;
+        } * 0.2
+            * envelope;
 
         wave.push(sample);
     }
@@ -337,7 +339,7 @@ fn create_beep_sound() -> Vec<f32> {
 impl eframe::App for MetronomeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let theme = Theme::dark();
-        
+
         let mut style = (*ctx.style()).clone();
         style.visuals.dark_mode = true;
         style.visuals.override_text_color = Some(theme.on_surface);
@@ -361,14 +363,14 @@ impl eframe::App for MetronomeApp {
         let random_mode = self.state.random_mode.load(Ordering::Relaxed);
         let random_count = self.state.random_count.load(Ordering::Relaxed);
         let remaining_ticks = self.state.remaining_ticks.load(Ordering::Relaxed);
-        
+
         if is_running {
             if let Ok(last_beat) = self.state.last_beat.lock() {
                 let time_since_beat = last_beat.elapsed().as_millis() as f32;
                 let beat_interval_ms = 60000.0 / bpm as f32;
-                
+
                 self.beat_progress = (time_since_beat / beat_interval_ms).min(1.0);
-                
+
                 if time_since_beat < 200.0 {
                     self.animation_progress = 1.0 - (time_since_beat / 200.0);
                 } else {
@@ -384,32 +386,36 @@ impl eframe::App for MetronomeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
-                ui.heading(egui::RichText::new("🎵 METRONOME STUDIO")
-                    .size(32.0)
-                    .color(theme.primary)
-                    .strong());
+                ui.heading(
+                    egui::RichText::new("🎵 METRONOME STUDIO")
+                        .size(32.0)
+                        .color(theme.primary)
+                        .strong(),
+                );
                 ui.add_space(10.0);
-                
-                let separator_rect = ui.allocate_space([ui.available_width() - 40.0, 2.0].into()).1;
+
+                let separator_rect = ui
+                    .allocate_space([ui.available_width() - 40.0, 2.0].into())
+                    .1;
                 ui.painter().rect_filled(
                     separator_rect,
                     egui::Rounding::same(1.0),
                     egui::Color32::from_rgba_premultiplied(138, 43, 226, 100),
                 );
             });
-            
+
             ui.add_space(30.0);
-            
+
             ui.vertical_centered(|ui| {
                 let base_size = 120.0;
-                let max_size = base_size + 40.0; 
-                let pulse_size = if self.animation_progress > 0.0 { 
-                    base_size + self.animation_progress * 40.0 
-                } else { 
-                    base_size 
+                let max_size = base_size + 40.0;
+                let pulse_size = if self.animation_progress > 0.0 {
+                    base_size + self.animation_progress * 40.0
+                } else {
+                    base_size
                 };
-                
-                let beat_color = if is_running { 
+
+                let beat_color = if is_running {
                     if self.animation_progress > 0.0 {
                         let intensity = 0.3 + self.animation_progress * 0.7;
                         egui::Color32::from_rgb(
@@ -420,13 +426,14 @@ impl eframe::App for MetronomeApp {
                     } else {
                         theme.primary
                     }
-                } else { 
-                    egui::Color32::from_gray(80) 
+                } else {
+                    egui::Color32::from_gray(80)
                 };
-                
+
                 let fixed_size = max_size + 40.0;
-                let (rect, _) = ui.allocate_exact_size([fixed_size, fixed_size].into(), egui::Sense::hover());
-                
+                let (rect, _) =
+                    ui.allocate_exact_size([fixed_size, fixed_size].into(), egui::Sense::hover());
+
                 if is_running && self.animation_progress > 0.0 {
                     let glow_radius = pulse_size / 2.0 + 15.0;
                     let glow_alpha = (self.animation_progress * 50.0) as u8;
@@ -436,14 +443,16 @@ impl eframe::App for MetronomeApp {
                         egui::Color32::from_rgba_premultiplied(138, 43, 226, glow_alpha),
                     );
                 }
-                
-                ui.painter().circle_filled(rect.center(), pulse_size / 2.0, beat_color);
-                
+
+                ui.painter()
+                    .circle_filled(rect.center(), pulse_size / 2.0, beat_color);
+
                 let highlight_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 60);
-                ui.painter().circle_filled(rect.center(), pulse_size / 2.0 - 5.0, highlight_color);
-                
+                ui.painter()
+                    .circle_filled(rect.center(), pulse_size / 2.0 - 5.0, highlight_color);
+
                 let symbol_size = if self.animation_progress > 0.0 {
-                    40.0 + self.animation_progress * 8.0 
+                    40.0 + self.animation_progress * 8.0
                 } else {
                     40.0
                 };
@@ -454,26 +463,32 @@ impl eframe::App for MetronomeApp {
                     egui::FontId::proportional(symbol_size),
                     egui::Color32::WHITE,
                 );
-                
+
                 ui.add_space(20.0);
-                ui.label(egui::RichText::new(format!("{} BPM", bpm))
-                    .size(24.0)
-                    .color(theme.on_surface)
-                    .strong());
+                ui.label(
+                    egui::RichText::new(format!("{} BPM", bpm))
+                        .size(24.0)
+                        .color(theme.on_surface)
+                        .strong(),
+                );
             });
-            
+
             ui.add_space(20.0);
-            
+
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Beat Progress")
-                    .size(14.0)
-                    .color(theme.accent));
+                ui.label(
+                    egui::RichText::new("Beat Progress")
+                        .size(14.0)
+                        .color(theme.accent),
+                );
                 ui.add_space(5.0);
-                
+
                 let slider_width = 400.0;
                 let slider_height = 12.0;
-                let slider_rect = ui.allocate_space([slider_width, slider_height + 20.0].into()).1;
-                
+                let slider_rect = ui
+                    .allocate_space([slider_width, slider_height + 20.0].into())
+                    .1;
+
                 let track_rect = egui::Rect::from_center_size(
                     slider_rect.center(),
                     egui::Vec2::new(slider_width, slider_height),
@@ -483,13 +498,13 @@ impl eframe::App for MetronomeApp {
                     egui::Rounding::same(slider_height / 2.0),
                     egui::Color32::from_gray(40),
                 );
-                
+
                 let progress_width = slider_width * self.beat_progress;
                 let progress_rect = egui::Rect::from_min_size(
                     track_rect.min,
                     egui::Vec2::new(progress_width, slider_height),
                 );
-                
+
                 let progress_color = if is_running {
                     if self.animation_progress > 0.5 {
                         egui::Color32::from_rgb(255, 255, 255)
@@ -499,34 +514,38 @@ impl eframe::App for MetronomeApp {
                 } else {
                     egui::Color32::from_gray(60)
                 };
-                
+
                 ui.painter().rect_filled(
                     progress_rect,
                     egui::Rounding::same(slider_height / 2.0),
                     progress_color,
                 );
-                
-                let num_subdivisions = 4; 
+
+                let num_subdivisions = 4;
                 for i in 1..num_subdivisions {
-                    let tick_x = track_rect.min.x + (slider_width * i as f32) / num_subdivisions as f32;
+                    let tick_x =
+                        track_rect.min.x + (slider_width * i as f32) / num_subdivisions as f32;
                     let tick_top = track_rect.min.y - 3.0;
                     let tick_bottom = track_rect.max.y + 3.0;
-                    
+
                     ui.painter().line_segment(
-                        [egui::pos2(tick_x, tick_top), egui::pos2(tick_x, tick_bottom)],
+                        [
+                            egui::pos2(tick_x, tick_top),
+                            egui::pos2(tick_x, tick_bottom),
+                        ],
                         egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
                     );
                 }
-                
+
                 let beat_marker_y = track_rect.center().y + 25.0;
                 for i in 0..=4 {
                     let marker_x = track_rect.min.x + (slider_width * i as f32) / 4.0;
                     let marker_color = if is_running && i == (tick_count % 4) as usize {
-                        egui::Color32::from_rgb(255, 215, 0) 
+                        egui::Color32::from_rgb(255, 215, 0)
                     } else {
                         theme.on_surface
                     };
-                    
+
                     ui.painter().text(
                         egui::pos2(marker_x, beat_marker_y),
                         egui::Align2::CENTER_CENTER,
@@ -535,25 +554,31 @@ impl eframe::App for MetronomeApp {
                         marker_color,
                     );
                 }
-                
+
                 if is_running {
                     let time_to_next_beat = (60000.0 / bpm as f32) * (1.0 - self.beat_progress);
                     ui.add_space(15.0);
-                    ui.label(egui::RichText::new(format!("Next beat in: {:.1}ms", time_to_next_beat))
-                        .size(12.0)
-                        .color(theme.accent));
+                    ui.label(
+                        egui::RichText::new(format!("Next beat in: {:.1}ms", time_to_next_beat))
+                            .size(12.0)
+                            .color(theme.accent),
+                    );
                 }
             });
-            
+
             ui.add_space(30.0);
-            
+
             egui::Frame::none()
                 .fill(theme.surface)
                 .rounding(egui::Rounding::same(12.0))
                 .inner_margin(egui::Margin::same(20.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🎵 Tempo:").size(16.0).color(theme.accent));
+                        ui.label(
+                            egui::RichText::new("🎵 Tempo:")
+                                .size(16.0)
+                                .color(theme.accent),
+                        );
                         ui.add_space(20.0);
                         let mut bpm_value = bpm as f32;
                         let slider = egui::Slider::new(&mut bpm_value, 30.0..=300.0)
@@ -563,63 +588,95 @@ impl eframe::App for MetronomeApp {
                             self.state.bpm.store(bpm_value as u32, Ordering::Relaxed);
                         }
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new(format!("{}", bpm))
-                            .size(16.0)
-                            .color(theme.primary)
-                            .strong());
+                        ui.label(
+                            egui::RichText::new(format!("{}", bpm))
+                                .size(16.0)
+                                .color(theme.primary)
+                                .strong(),
+                        );
                     });
-                    
+
                     ui.add_space(15.0);
-                    
+
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🔊 Volume:").size(16.0).color(theme.accent));
+                        ui.label(
+                            egui::RichText::new("🔊 Volume:")
+                                .size(16.0)
+                                .color(theme.accent),
+                        );
                         ui.add_space(10.0);
                         let mut volume_value = volume as f32;
                         let slider = egui::Slider::new(&mut volume_value, 0.0..=100.0)
                             .show_value(false)
                             .handle_shape(egui::style::HandleShape::Circle);
                         if ui.add_sized([250.0, 25.0], slider).changed() {
-                            self.state.volume.store(volume_value as u32, Ordering::Relaxed);
+                            self.state
+                                .volume
+                                .store(volume_value as u32, Ordering::Relaxed);
                         }
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new(format!("{}%", volume))
-                            .size(16.0)
-                            .color(theme.primary)
-                            .strong());
+                        ui.label(
+                            egui::RichText::new(format!("{}%", volume))
+                                .size(16.0)
+                                .color(theme.primary)
+                                .strong(),
+                        );
                     });
                 });
-            
+
             ui.add_space(20.0);
-            
+
             egui::Frame::none()
-                .fill(if random_mode { theme.warning.gamma_multiply(0.2) } else { theme.surface })
+                .fill(if random_mode {
+                    theme.warning.gamma_multiply(0.2)
+                } else {
+                    theme.surface
+                })
                 .rounding(egui::Rounding::same(12.0))
                 .inner_margin(egui::Margin::same(15.0))
-                .stroke(if random_mode { 
-                    egui::Stroke::new(2.0, theme.warning) 
-                } else { 
-                    egui::Stroke::NONE 
+                .stroke(if random_mode {
+                    egui::Stroke::new(2.0, theme.warning)
+                } else {
+                    egui::Stroke::NONE
                 })
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let random_text = if random_mode { "🎲 RANDOM MODE: ON" } else { "🎯 Random Mode: OFF" };
-                        let button_color = if random_mode { theme.warning } else { theme.surface };
-                        
-                        if ui.add_sized([180.0, 35.0], 
-                            egui::Button::new(egui::RichText::new(random_text).size(14.0).strong())
+                        let random_text = if random_mode {
+                            "🎲 RANDOM MODE: ON"
+                        } else {
+                            "🎯 Random Mode: OFF"
+                        };
+                        let button_color = if random_mode {
+                            theme.warning
+                        } else {
+                            theme.surface
+                        };
+
+                        if ui
+                            .add_sized(
+                                [180.0, 35.0],
+                                egui::Button::new(
+                                    egui::RichText::new(random_text).size(14.0).strong(),
+                                )
                                 .fill(button_color)
-                                .rounding(egui::Rounding::same(8.0))
-                        ).clicked() {
+                                .rounding(egui::Rounding::same(8.0)),
+                            )
+                            .clicked()
+                        {
                             let new_random_mode = !random_mode;
-                            self.state.random_mode.store(new_random_mode, Ordering::Relaxed);
-                            
+                            self.state
+                                .random_mode
+                                .store(new_random_mode, Ordering::Relaxed);
+
                             if new_random_mode {
-                                self.state.remaining_ticks.store(random_count, Ordering::Relaxed);
+                                self.state
+                                    .remaining_ticks
+                                    .store(random_count, Ordering::Relaxed);
                             } else {
                                 self.state.remaining_ticks.store(0, Ordering::Relaxed);
                             }
                         }
-                        
+
                         if random_mode {
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("Change every:").color(theme.warning));
@@ -630,44 +687,52 @@ impl eframe::App for MetronomeApp {
                             if ui.add_sized([150.0, 20.0], slider).changed() {
                                 let new_count = random_count_value as u32;
                                 self.state.random_count.store(new_count, Ordering::Relaxed);
-                                
+
                                 if is_running && remaining_ticks > new_count {
-                                    self.state.remaining_ticks.store(new_count, Ordering::Relaxed);
+                                    self.state
+                                        .remaining_ticks
+                                        .store(new_count, Ordering::Relaxed);
                                 }
                             }
                         }
                     });
-                    
+
                     if random_mode {
                         ui.add_space(10.0);
                         if is_running {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("🎲 Next BPM change in: {} beats", remaining_ticks))
-                                    .color(theme.warning));
-                                
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "🎲 Next BPM change in: {} beats",
+                                        remaining_ticks
+                                    ))
+                                    .color(theme.warning),
+                                );
+
                                 ui.add_space(20.0);
-                                
+
                                 let progress = if random_count > 0 {
                                     (random_count - remaining_ticks) as f32 / random_count as f32
                                 } else {
                                     0.0
                                 };
-                                
+
                                 let progress_bar_width = 120.0;
-                                let progress_rect = ui.allocate_space([progress_bar_width, 8.0].into()).1;
-                                
+                                let progress_rect =
+                                    ui.allocate_space([progress_bar_width, 8.0].into()).1;
+
                                 ui.painter().rect_filled(
                                     progress_rect,
                                     egui::Rounding::same(4.0),
                                     egui::Color32::from_gray(40),
                                 );
-                                
+
                                 let fill_width = progress_rect.width() * progress;
                                 let fill_rect = egui::Rect::from_min_size(
                                     progress_rect.min,
                                     egui::Vec2::new(fill_width, progress_rect.height()),
                                 );
-                                
+
                                 ui.painter().rect_filled(
                                     fill_rect,
                                     egui::Rounding::same(4.0),
@@ -675,119 +740,176 @@ impl eframe::App for MetronomeApp {
                                 );
                             });
                         } else {
-                            ui.label(egui::RichText::new("🎲 Will change BPM every {} beats (Range: 60-200)")
-                                .color(theme.warning));
+                            ui.label(
+                                egui::RichText::new(
+                                    "🎲 Will change BPM every {} beats (Range: 60-200)",
+                                )
+                                .color(theme.warning),
+                            );
                         }
                     }
                 });
-            
+
             ui.add_space(25.0);
-            
+
             ui.vertical_centered(|ui| {
-                let button_text = if is_running { "⏹️  STOP" } else { "▶️  START" };
-                let button_color = if is_running { theme.error } else { theme.success };
-                
-                if ui.add_sized([200.0, 50.0], 
-                    egui::Button::new(egui::RichText::new(button_text).size(18.0).strong())
-                        .fill(button_color)
-                        .rounding(egui::Rounding::same(25.0))
-                ).clicked() {
+                let button_text = if is_running {
+                    "⏹️  STOP"
+                } else {
+                    "▶️  START"
+                };
+                let button_color = if is_running {
+                    theme.error
+                } else {
+                    theme.success
+                };
+
+                if ui
+                    .add_sized(
+                        [200.0, 50.0],
+                        egui::Button::new(egui::RichText::new(button_text).size(18.0).strong())
+                            .fill(button_color)
+                            .rounding(egui::Rounding::same(25.0)),
+                    )
+                    .clicked()
+                {
                     let new_state = !is_running;
                     self.state.is_running.store(new_state, Ordering::Relaxed);
                     if new_state {
                         self.state.tick_count.store(0, Ordering::Relaxed);
-                        
+
                         if random_mode {
-                            self.state.remaining_ticks.store(random_count, Ordering::Relaxed);
+                            self.state
+                                .remaining_ticks
+                                .store(random_count, Ordering::Relaxed);
                         }
                     }
                 }
             });
-            
+
             ui.add_space(25.0);
-            
+
             egui::Frame::none()
                 .fill(theme.surface)
                 .rounding(egui::Rounding::same(12.0))
                 .inner_margin(egui::Margin::same(15.0))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("🎵 Sound Selection:").size(16.0).color(theme.accent));
+                    ui.label(
+                        egui::RichText::new("🎵 Sound Selection:")
+                            .size(16.0)
+                            .color(theme.accent),
+                    );
                     ui.add_space(10.0);
-                    
+
                     let sounds = [
-                        ("🔔", "Beep"), ("🥁", "Kick"), ("🖱️", "Click"), ("🔔", "Cowbell"),
-                        ("🎺", "Hi-hat"), ("🪵", "Woodblock"), ("🔺", "Triangle"), ("⬜", "Square")
+                        ("🔔", "Beep"),
+                        ("🥁", "Kick"),
+                        ("🖱️", "Click"),
+                        ("🔔", "Cowbell"),
+                        ("🎺", "Hi-hat"),
+                        ("🪵", "Woodblock"),
+                        ("🔺", "Triangle"),
+                        ("⬜", "Square"),
                     ];
                     let current_sound = self.state.sound_type.load(Ordering::Relaxed) as usize;
-                    
+
                     ui.horizontal_wrapped(|ui| {
                         for (i, (icon, name)) in sounds.iter().enumerate() {
                             let selected = i == current_sound;
-                            let button_color = if selected { theme.primary } else { theme.surface };
-                            let text_color = if selected { egui::Color32::WHITE } else { theme.on_surface };
-                            
-                            if ui.add_sized([80.0, 35.0],
-                                egui::Button::new(egui::RichText::new(format!("{}\n{}", icon, name))
-                                    .size(10.0)
-                                    .color(text_color))
+                            let button_color = if selected {
+                                theme.primary
+                            } else {
+                                theme.surface
+                            };
+                            let text_color = if selected {
+                                egui::Color32::WHITE
+                            } else {
+                                theme.on_surface
+                            };
+
+                            if ui
+                                .add_sized(
+                                    [80.0, 35.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("{}\n{}", icon, name))
+                                            .size(10.0)
+                                            .color(text_color),
+                                    )
                                     .fill(button_color)
-                                    .rounding(egui::Rounding::same(8.0))
-                            ).clicked() {
+                                    .rounding(egui::Rounding::same(8.0)),
+                                )
+                                .clicked()
+                            {
                                 self.state.sound_type.store(i as u32, Ordering::Relaxed);
                             }
                         }
                     });
                 });
-            
+
             ui.add_space(20.0);
-            
+
             egui::Frame::none()
                 .fill(theme.surface)
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(15.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let status_color = if is_running { theme.success } else { theme.error };
+                        let status_color = if is_running {
+                            theme.success
+                        } else {
+                            theme.error
+                        };
                         let status_icon = if is_running { "🟢" } else { "🔴" };
-                        let status_text = if is_running { 
+                        let status_text = if is_running {
                             if random_mode {
                                 format!("PLAYING (Random Mode) - Beat #{}", tick_count)
                             } else {
                                 format!("PLAYING - Beat #{}", tick_count)
                             }
-                        } else { 
-                            "STOPPED".to_string() 
+                        } else {
+                            "STOPPED".to_string()
                         };
-                        
-                        ui.label(egui::RichText::new(format!("{} {}", status_icon, status_text))
-                            .size(14.0)
-                            .color(status_color)
-                            .strong());
-                        
+
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", status_icon, status_text))
+                                .size(14.0)
+                                .color(status_color)
+                                .strong(),
+                        );
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("Beat Pattern:").color(theme.on_surface));
                             ui.add_space(10.0);
-                            
+
                             for i in 1..=4 {
                                 let active = is_running && i <= (tick_count % 4) + 1;
-                                let dot_color = if active { theme.primary } else { egui::Color32::from_gray(60) };
+                                let dot_color = if active {
+                                    theme.primary
+                                } else {
+                                    egui::Color32::from_gray(60)
+                                };
                                 let dot_size = if active { 12.0 } else { 8.0 };
-                                
-                                let (rect, _) = ui.allocate_exact_size([16.0, 16.0].into(), egui::Sense::hover());
-                                ui.painter().circle_filled(rect.center(), dot_size / 2.0, dot_color);
-                                
+
+                                let (rect, _) = ui
+                                    .allocate_exact_size([16.0, 16.0].into(), egui::Sense::hover());
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    dot_size / 2.0,
+                                    dot_color,
+                                );
+
                                 if active {
                                     ui.painter().circle_filled(
-                                        rect.center(), 
-                                        dot_size / 2.0 + 2.0, 
-                                        egui::Color32::from_rgba_premultiplied(138, 43, 226, 30)
+                                        rect.center(),
+                                        dot_size / 2.0 + 2.0,
+                                        egui::Color32::from_rgba_premultiplied(138, 43, 226, 30),
                                     );
                                 }
                             }
                         });
                     });
                 });
-            
+
             ui.add_space(10.0);
         });
     }
@@ -802,7 +924,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_resizable(true),
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "Metronome Studio",
         options,
