@@ -162,7 +162,7 @@ fn metronome_thread(
                     
                     if remaining == 0 {
                         let mut rng = rand::thread_rng();
-                        let new_bpm = rng.gen_range(60..=200);
+                        let new_bpm = rng.gen_range(60..=150); // set min/max random value
                         state.bpm.store(new_bpm, Ordering::Relaxed);
                     }
                 }
